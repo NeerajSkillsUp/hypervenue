@@ -27,24 +27,30 @@ const verifyJWT = (req, res, next) => {
   }
 };
 
-// 1. Auth Service Proxy (Public access)
+// 1. Auth Service Proxy (Public access - pathRewrite RESTORED)
 app.use(
   '/api/auth',
   createProxyMiddleware({
-    target: process.env.AUTH_SERVICE_URL,
+    target: process.env.AUTH_SERVICE_URL || 'http://127.0.0.1:4001',
     changeOrigin: true,
-    pathRewrite: { '^/': '/api/v1/auth/' } // Rewrites /register -> /api/v1/auth/register
+    pathRewrite: { '^/': '/api/v1/auth/' }
   })
 );
 
-// 2. Booking Service Proxy (Protected)
+// 2. Booking Service Proxy (Public for seats GET, Protected for locking/booking)
 app.use(
   '/api/booking',
-  verifyJWT,
+  (req, res, next) => {
+    // Allow fetching seats without a token (PUBLIC)
+    if (req.method === 'GET' && req.path.includes('/seats')) {
+      return next();
+    }
+    // Require authentication for locking/booking (PRIVATE)
+    return verifyJWT(req, res, next);
+  },
   createProxyMiddleware({
-    target: process.env.BOOKING_SERVICE_URL,
-    changeOrigin: true,
-    pathRewrite: { '^/': '/api/v1/booking/' }
+    target: process.env.BOOKING_SERVICE_URL || 'http://127.0.0.1:4002',
+    changeOrigin: true
   })
 );
 
@@ -53,7 +59,7 @@ app.use(
   '/api/food',
   verifyJWT,
   createProxyMiddleware({
-    target: process.env.FOOD_SERVICE_URL,
+    target: process.env.FOOD_SERVICE_URL || 'http://127.0.0.1:4003',
     changeOrigin: true,
     pathRewrite: { '^/': '/api/v1/food/' }
   })

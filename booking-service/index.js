@@ -37,77 +37,80 @@ setInterval(async () => {
   }
 }, 30000); // Runs every 30 seconds
 
-// 1. GET ALL SEATS FOR AN EVENT
-app.get('/api/v1/booking/events/:eventId/seats', async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT id, seat_number, price_cents, status FROM seats WHERE event_id = $1 ORDER BY seat_number ASC',
-      [req.params.eventId]
-    );
-    return res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Internal server error' });
+// 1. GET ALL SEATS FOR AN EVENT (Supports both stripped and full path)
+app.get(
+  ['/events/:eventId/seats', '/api/booking/events/:eventId/seats'], 
+  async (req, res) => {
+    const { eventId } = req.params;
+    try {
+      const result = await pool.query(
+        'SELECT * FROM seats WHERE event_id = $1 ORDER BY seat_number ASC',
+        [eventId]
+      );
+      res.json(result.rows);
+    } catch (err) {
+      console.error('Database Query Error:', err);
+      res.status(500).json({ error: 'Database query failed' });
+    }
   }
-});
+);
 
-// 2. ATOMIC SEAT LOCK (Prevents Double Booking using SELECT ... FOR UPDATE)
-app.post('/api/v1/booking/lock', async (req, res) => {
-  const { seatId } = req.body;
-  const userId = req.headers['x-user-id'] || 'test-user-id'; // Injected by Gateway
+// 2. ATOMIC SEAT LOCK (Supports all route variations)
+app.post(
+  ['/lock', '/api/booking/lock', '/api/v1/booking/lock'], 
+  async (req, res) => {
+    const { seatId } = req.body;
+    const userId = req.headers['x-user-id'] || 'test-user-id';
 
-  if (!seatId) {
-    return res.status(400).json({ error: 'seatId is required' });
-  }
-
-  // Reserve a dedicated connection client from pool for atomic transaction
-  const client = await pool.connect();
-
-  try {
-    await client.query('BEGIN');
-
-    // Row-level exclusive lock on the selected seat
-    const seatResult = await client.query(
-      'SELECT id, status FROM seats WHERE id = $1 FOR UPDATE',
-      [seatId]
-    );
-
-    if (seatResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Seat not found' });
+    if (!seatId) {
+      return res.status(400).json({ error: 'seatId is required' });
     }
 
-    const seat = seatResult.rows[0];
+    const client = await pool.connect();
 
-    if (seat.status !== 'AVAILABLE') {
+    try {
+      await client.query('BEGIN');
+
+      const seatResult = await client.query(
+        'SELECT id, status FROM seats WHERE id = $1 FOR UPDATE',
+        [seatId]
+      );
+
+      if (seatResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Seat not found' });
+      }
+
+      const seat = seatResult.rows[0];
+
+      if (seat.status !== 'AVAILABLE') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Seat is no longer available or already locked' });
+      }
+
+      await client.query(
+        "UPDATE seats SET status = 'LOCKED', locked_at = NOW() WHERE id = $1",
+        [seatId]
+      );
+
+      await client.query('COMMIT');
+
+      await redis.set(`seat_hold:${seatId}`, userId, 'EX', 300);
+
+      return res.json({
+        message: 'Seat locked successfully for 5 minutes',
+        seatId,
+        expiresInSeconds: 300
+      });
+    } catch (err) {
       await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'Seat is no longer available or already locked' });
+      console.error(err);
+      return res.status(500).json({ error: 'Internal server error' });
+    } finally {
+      client.release();
     }
-
-    // Update seat status to LOCKED with timestamp
-    await client.query(
-      "UPDATE seats SET status = 'LOCKED', locked_at = NOW() WHERE id = $1",
-      [seatId]
-    );
-
-    await client.query('COMMIT');
-
-    // Set Redis key with 5-minute TTL (300s)
-    await redis.set(`seat_hold:${seatId}`, userId, 'EX', 300);
-
-    return res.json({
-      message: 'Seat locked successfully for 5 minutes',
-      seatId,
-      expiresInSeconds: 300
-    });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    return res.status(500).json({ error: 'Internal server error' });
-  } finally {
-    client.release(); // Always release connection back to the pool
   }
-});
+);
 
 const PORT = process.env.PORT || 4002;
 app.listen(PORT, () => console.log(`Booking Service running on port ${PORT}`));
