@@ -1,5 +1,26 @@
 @import "tailwindcss";
 
-body {
-  @apply bg-slate-950 text-slate-100 min-h-screen font-sans;
+@layer base {
+  body {
+    background-color: #09090b; /* Zinc 950 - deep charcoal dark theme */
+    color: #f4f4f5; /* Zinc 100 */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow-x: hidden;
+  }
+}
+
+/* Custom dark scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #09090b;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
 }

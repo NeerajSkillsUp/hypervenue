@@ -1,64 +1,89 @@
-import { Ticket, ShoppingBag, Lock, LogOut, UserCheck } from 'lucide-react';
+import { ShoppingBag, Lock, LogOut } from 'lucide-react';
 
 export default function Navbar({ activeTab, setActiveTab, token, onLogout }) {
   return (
-    <nav className="border-b border-slate-800 bg-slate-900/80 backdrop-blur-md sticky top-0 z-50 px-6 py-4 flex items-center justify-between">
-      <div className="flex items-center gap-3">
-        <div className="bg-indigo-600 p-2 rounded-xl shadow-lg shadow-indigo-500/30">
-          <Ticket className="w-6 h-6 text-white" />
-        </div>
-        <span className="font-extrabold text-xl tracking-tight bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">
-          HyperVenue
-        </span>
-      </div>
+    <header className="sticky top-0 z-50 w-full border-b border-white/[0.08] bg-zinc-950/80 backdrop-blur-xl">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
 
-      <div className="flex items-center gap-2 bg-slate-950 p-1 rounded-xl border border-slate-800">
-        <button
+        {/* Brand Logo (Updated with image logo) */}
+        <div 
+          className="flex items-center gap-3 cursor-pointer select-none group" 
           onClick={() => setActiveTab('booking')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-            activeTab === 'booking'
-              ? 'bg-indigo-600 text-white shadow-md'
-              : 'text-slate-400 hover:text-white'
-          }`}
         >
-          <Lock className="w-4 h-4" /> Seat Booking
-        </button>
-
-        <button
-          onClick={() => setActiveTab('food')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-            activeTab === 'food'
-              ? 'bg-indigo-600 text-white shadow-md'
-              : 'text-slate-400 hover:text-white'
-          }`}
-        >
-          <ShoppingBag className="w-4 h-4" /> Food & Beverage
-        </button>
-      </div>
-
-      <div className="flex items-center gap-3">
-        {token ? (
-          <div className="flex items-center gap-3">
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              <UserCheck className="w-3.5 h-3.5" /> Authenticated
+          <img 
+            src="/logo.png" 
+            alt="HyperVenue Logo" 
+            className="w-9 h-9 rounded-xl shadow-lg shadow-indigo-500/20 group-hover:scale-105 transition-transform duration-200 object-cover" 
+          />
+          <div className="flex items-center gap-2">
+            <span className="text-base font-bold tracking-tight text-white font-mono">
+              HYPER<span className="text-indigo-400">VENUE</span>
             </span>
-            <button
-              onClick={onLogout}
-              className="p-2 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-lg transition-colors"
-              title="Logout"
-            >
-              <LogOut className="w-5 h-5" />
-            </button>
+            <span className="px-1.5 py-0.5 text-[10px] font-mono font-medium tracking-wider text-indigo-400 bg-indigo-500/10 border border-indigo-500/20 rounded">
+              ENTERPRISE
+            </span>
           </div>
-        ) : (
+        </div>
+
+        {/* Segmented Control Navigation Tabs */}
+        <nav className="flex items-center p-1 rounded-full bg-zinc-900/90 border border-white/[0.08] shadow-inner">
           <button
-            onClick={() => setActiveTab('auth')}
-            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg transition-all"
+            onClick={() => setActiveTab('booking')}
+            className={`flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-medium transition-all duration-200 ${
+              activeTab === 'booking'
+                ? 'bg-zinc-800 text-white shadow-sm ring-1 ring-white/10'
+                : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40'
+            }`}
           >
-            Sign In / Register
+            <Lock className="w-3.5 h-3.5" />
+            Seat Booking
           </button>
-        )}
+
+          <button
+            onClick={() => setActiveTab('food')}
+            className={`flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-medium transition-all duration-200 ${
+              activeTab === 'food'
+                ? 'bg-zinc-800 text-white shadow-sm ring-1 ring-white/10'
+                : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40'
+            }`}
+          >
+            <ShoppingBag className="w-3.5 h-3.5" />
+            Food & Catering
+          </button>
+        </nav>
+
+        {/* Right Status / Auth Actions */}
+        <div className="flex items-center gap-3">
+          {token ? (
+            <div className="flex items-center gap-3">
+              {/* Live Pulsing Auth Badge */}
+              <div className="flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+                Authenticated
+              </div>
+
+              <button
+                onClick={onLogout}
+                className="p-2 text-zinc-400 hover:text-rose-400 hover:bg-zinc-900 border border-transparent hover:border-zinc-800 rounded-lg transition-all"
+                title="Sign Out"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setActiveTab('auth')}
+              className="px-4 py-1.5 bg-white hover:bg-zinc-200 text-zinc-950 text-xs font-semibold rounded-full transition-all shadow-sm active:scale-95"
+            >
+              Sign In
+            </button>
+          )}
+        </div>
+
       </div>
-    </nav>
+    </header>
   );
 }
