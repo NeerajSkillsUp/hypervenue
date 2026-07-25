@@ -23,6 +23,12 @@ app.use((req, res, next) => {
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const redis = new Redis(process.env.REDIS_URL);
 
+// Helper function: Validate standard UUID string format
+const isValidUUID = (id) => {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return id && id !== 'null' && id !== 'undefined' && uuidRegex.test(id);
+};
+
 // -------------------------------------------------------------
 // Periodic Background Cleanup Job: Release expired seat locks
 // -------------------------------------------------------------
@@ -63,7 +69,7 @@ app.get(
   }
 );
 
-// 2. FETCH TICKET DETAILS (Updated with all route aliases)
+// 2. FETCH TICKET DETAILS (Protected against invalid UUID syntax error 22P02)
 app.get(
   [
     '/tickets/:bookingId', 
@@ -71,8 +77,15 @@ app.get(
     '/api/v1/booking/tickets/:bookingId'
   ], 
   async (req, res) => {
+    const { bookingId } = req.params;
+
+    // 🛡️ UUID Guard check
+    if (!isValidUUID(bookingId)) {
+      return res.status(400).json({ error: 'A valid Booking UUID is required' });
+    }
+
     try {
-      const result = await pool.query('SELECT * FROM bookings WHERE id = $1', [req.params.bookingId]);
+      const result = await pool.query('SELECT * FROM bookings WHERE id = $1', [bookingId]);
       if (result.rows.length === 0) {
         return res.status(404).json({ error: 'Ticket not found' });
       }
@@ -84,12 +97,44 @@ app.get(
   }
 );
 
+// 2b. FETCH EVERY TICKET BELONGING TO THE LOGGED-IN USER (for "My Tickets & QR")
+// Requires a JWT (enforced at the gateway) so we know whose bookings to return.
+app.get(
+  [
+    '/my-tickets',
+    '/api/booking/my-tickets',
+    '/api/v1/booking/my-tickets'
+  ],
+  async (req, res) => {
+    const userId = req.headers['x-user-id'];
+
+    if (!userId) {
+      return res.status(401).json({ error: 'Missing or malformed Authorization header' });
+    }
+
+    try {
+      const result = await pool.query(
+        `SELECT b.*, s.seat_number, s.price_cents
+         FROM bookings b
+         JOIN seats s ON s.id = b.seat_id
+         WHERE b.user_id = $1 AND b.payment_status = 'COMPLETED'
+         ORDER BY s.seat_number ASC`,
+        [userId]
+      );
+      return res.json(result.rows);
+    } catch (err) {
+      console.error('My tickets fetch error:', err);
+      return res.status(500).json({ error: 'Failed to fetch your tickets' });
+    }
+  }
+);
+
 // 3. GATE SCANNER CHECK-IN
 app.post(['/checkin', '/api/booking/checkin', '/api/v1/booking/checkin'], async (req, res) => {
   const { bookingId } = req.body;
 
-  if (!bookingId) {
-    return res.status(400).json({ error: 'bookingId is required' });
+  if (!isValidUUID(bookingId)) {
+    return res.status(400).json({ error: 'A valid Booking UUID is required' });
   }
 
   try {

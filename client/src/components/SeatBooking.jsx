@@ -1,7 +1,5 @@
 import { useState, useEffect } from 'react';
 import api from '../api';
-import Checkout from './Checkout';
-import TicketView from './TicketView';
 import { 
   Lock, 
   Clock, 
@@ -15,7 +13,7 @@ import {
 
 const EVENT_ID = '11111111-1111-1111-1111-111111111111';
 
-export default function SeatBooking({ token }) {
+export default function SeatBooking({ token, onSelectSeat }) {
   const [seats, setSeats] = useState([]);
   const [loading, setLoading] = useState(true);
   const [lockingId, setLockingId] = useState(null);
@@ -23,25 +21,35 @@ export default function SeatBooking({ token }) {
   const [error, setError] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
-  // Modal Flow States
-  const [activeCheckoutSeat, setActiveCheckoutSeat] = useState(null);
-  const [activeBookingId, setActiveBookingId] = useState(null);
-
   useEffect(() => {
+    let isMounted = true;
+
     const fetchSeats = async () => {
       try {
         const res = await api.get(`/api/booking/events/${EVENT_ID}/seats`);
-        setSeats(res.data);
+        if (isMounted) {
+          const rawSeats = Array.isArray(res.data) ? res.data : res.data?.seats || [];
+          setSeats(rawSeats);
+          setError(null);
+        }
       } catch (err) {
-        setError(err.response?.data?.error || 'Failed to fetch seats');
+        if (isMounted) {
+          setError(err.response?.data?.error || 'Failed to fetch seats');
+        }
       } finally {
-        setLoading(false);
+        if (isMounted) {
+          setLoading(false);
+        }
       }
     };
 
     fetchSeats();
     const interval = setInterval(fetchSeats, 5000);
-    return () => clearInterval(interval);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
   }, [refreshKey]);
 
   const handleLockSeat = async (seat) => {
@@ -56,11 +64,14 @@ export default function SeatBooking({ token }) {
 
     try {
       const res = await api.post('/api/booking/lock', { seatId: seat.id });
-      setMessage(res.data.message);
+      setMessage(res.data.message || 'Seat locked for 5 minutes!');
       setRefreshKey((prev) => prev + 1);
-      
-      // Lock successful -> open Stripe Checkout Modal
-      setActiveCheckoutSeat(seat);
+
+      // Lock successful -> hand off to App.jsx, which owns the
+      // Checkout -> Ticket flow (and the "My Tickets & QR" tab state).
+      if (typeof onSelectSeat === 'function') {
+        onSelectSeat(seat);
+      }
     } catch (err) {
       setError(err.response?.data?.error || 'Seat locking failed');
     } finally {
@@ -68,8 +79,9 @@ export default function SeatBooking({ token }) {
     }
   };
 
-  const availableCount = seats.filter(s => s.status === 'AVAILABLE').length;
-  const lockedCount = seats.filter(s => s.status === 'LOCKED').length;
+  const seatList = Array.isArray(seats) ? seats : [];
+  const availableCount = seatList.filter((s) => s.status === 'AVAILABLE').length;
+  const lockedCount = seatList.filter((s) => s.status === 'LOCKED').length;
 
   return (
     <div className="max-w-5xl mx-auto space-y-6">
@@ -152,7 +164,7 @@ export default function SeatBooking({ token }) {
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
-            {seats.map((seat) => {
+            {seatList.map((seat) => {
               const isAvailable = seat.status === 'AVAILABLE';
               const isLocked = seat.status === 'LOCKED';
               const isPending = lockingId === seat.id;
@@ -172,12 +184,12 @@ export default function SeatBooking({ token }) {
                 >
                   {/* Seat Identifier */}
                   <div className="text-base font-bold tracking-tight text-white group-hover:text-indigo-300 transition-colors">
-                    {seat.seat_number}
+                    {seat.seat_number || seat.number}
                   </div>
 
                   {/* Price Tag */}
                   <div className="text-xs font-mono text-zinc-400">
-                    ${(seat.price_cents / 100).toFixed(2)}
+                    ${((seat.price_cents || seat.priceCents || 15000) / 100).toFixed(2)}
                   </div>
 
                   {/* Status Indicator */}
@@ -202,32 +214,6 @@ export default function SeatBooking({ token }) {
           </div>
         )}
       </div>
-
-      {/* Stripe Payment Modal */}
-      {activeCheckoutSeat && (
-        <Checkout
-          seatId={activeCheckoutSeat.id}
-          seatNumber={activeCheckoutSeat.seat_number}
-          priceCents={activeCheckoutSeat.price_cents}
-          onClose={() => setActiveCheckoutSeat(null)}
-          onSuccess={(bookingId) => {
-            setActiveCheckoutSeat(null);
-            setActiveBookingId(bookingId);
-          }}
-        />
-      )}
-
-      {/* QR Ticket Modal */}
-      {activeBookingId && (
-        <TicketView
-          bookingId={activeBookingId}
-          onClose={() => {
-            setActiveBookingId(null);
-            setRefreshKey((prev) => prev + 1);
-          }}
-        />
-      )}
-
     </div>
   );
 }

@@ -47,15 +47,32 @@ app.use(
 );
 
 // 2. Booking Service Proxy
-// 2. Booking Service Proxy
 app.use(
   '/api/booking',
   (req, res, next) => {
-    // Public GET requests to view seats don't require JWT
+    // Normalize trailing slashes so '/checkin' and '/checkin/' match the same way
+    const path = req.path.replace(/\/+$/, '') || '/';
+
+    // "My tickets" needs to know WHO is asking, so it always requires a JWT
+    // even though it's a GET request.
+    if (path === '/my-tickets') {
+      return verifyJWT(req, res, next);
+    }
+
+    // The gate scanner is operated by venue staff scanning an attendee's QR
+    // code — it is NOT the ticket buyer's authenticated browser session, so
+    // it must never require the buyer's JWT. Ticket validity is enforced by
+    // the booking-service itself (valid UUID, paid, not already checked in).
+    if (req.method === 'POST' && path === '/checkin') {
+      return next();
+    }
+
+    // Public GET requests (seat map, single ticket lookup) don't require JWT.
     if (req.method === 'GET') {
       return next();
     }
-    // All other operations (reserve/lock seat) require JWT
+
+    // All other operations (lock seat, checkout, confirm-dev) require JWT.
     return verifyJWT(req, res, next);
   },
   createProxyMiddleware({

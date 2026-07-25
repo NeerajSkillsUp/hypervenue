@@ -1,11 +1,18 @@
 import { useEffect, useState, useRef } from 'react';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js';
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4, validate as validateUUID } from 'uuid';
 import api from '../api';
 
 const stripePublicKey = import.meta.env.VITE_STRIPE_PUBLIC_KEY;
 const stripePromise = stripePublicKey ? loadStripe(stripePublicKey) : null;
+
+const ensureValidUUID = (id) => {
+  if (!id) return null;
+  const idStr = String(id);
+  if (validateUUID(idStr)) return idStr;
+  return '00000000-0000-4000-8000-' + idStr.padStart(12, '0').slice(-12);
+};
 
 function PaymentForm({ bookingId, seatId, onSuccess, onClose, isProcessing, setIsProcessing }) {
   const stripe = useStripe();
@@ -17,7 +24,6 @@ function PaymentForm({ bookingId, seatId, onSuccess, onClose, isProcessing, setI
 
     setIsProcessing(true);
 
-    // 1. Confirm payment with Stripe
     const { error, paymentIntent } = await stripe.confirmPayment({
       elements,
       redirect: 'if_required',
@@ -26,16 +32,22 @@ function PaymentForm({ bookingId, seatId, onSuccess, onClose, isProcessing, setI
     if (error) {
       alert(error.message);
       setIsProcessing(false);
-    } else if (paymentIntent && paymentIntent.status === 'succeeded') {
-      // 2. Dev Fallback: Confirm booking directly with backend so you don't get stuck on loading screen
+      return;
+    }
+
+    if (paymentIntent && paymentIntent.status === 'succeeded') {
       try {
         await api.post('/api/booking/confirm-dev', { bookingId, seatId });
       } catch (confirmErr) {
-        console.warn('Dev confirmation error, proceeding to polling/onSuccess:', confirmErr);
+        console.warn('Dev confirmation endpoint warning:', confirmErr);
       }
-      onSuccess(bookingId);
+
+      if (typeof onSuccess === 'function') {
+        // Always pass raw ID string
+        onSuccess(bookingId);
+      }
     } else {
-      onSuccess(bookingId);
+      setIsProcessing(false);
     }
   };
 
@@ -63,42 +75,52 @@ function PaymentForm({ bookingId, seatId, onSuccess, onClose, isProcessing, setI
   );
 }
 
-export default function Checkout({ seatId, seatNumber, priceCents, onSuccess, onClose }) {
+export default function Checkout({ seatId, seatNumber, priceCents, onSuccess, onPaymentSubmitted, onClose, onCancel }) {
   const idempotencyKey = useRef(uuidv4());
   
-  // Initialize error state immediately if key is missing
+  const handleSuccess = onSuccess || onPaymentSubmitted;
+  const handleClose = onClose || onCancel;
+
+  const validSeatId = ensureValidUUID(seatId);
+
   const [errorMessage, setErrorMessage] = useState(
-    !stripePublicKey ? 'Missing VITE_STRIPE_PUBLIC_KEY in client/.env' : null
+    !stripePublicKey 
+      ? 'Missing VITE_STRIPE_PUBLIC_KEY in client/.env' 
+      : !validSeatId 
+        ? 'Invalid seat selection: Missing valid seat ID.' 
+        : null
   );
   const [clientSecret, setClientSecret] = useState(null);
   const [bookingId, setBookingId] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
 
   useEffect(() => {
-    // Exit early if missing key
-    if (!stripePublicKey) return;
+    if (!stripePublicKey || !validSeatId) return;
 
     api.post('/api/booking/checkout', {
-      seatId,
+      seatId: validSeatId,
       idempotencyKey: idempotencyKey.current,
     })
     .then((res) => {
-      console.log('Backend response:', res.data);
-      
       const secret = res.data.clientSecret || res.data.client_secret;
+      const returnedBookingId = res.data.bookingId || res.data.booking_id || res.data.id;
 
-      if (secret) {
+      if (secret && returnedBookingId) {
         setClientSecret(secret);
-        setBookingId(res.data.bookingId);
+        setBookingId(String(returnedBookingId));
       } else {
-        setErrorMessage('Backend response missing clientSecret. Check backend JSON response keys.');
+        setErrorMessage('Checkout failed: Missing clientSecret or bookingId from server.');
       }
     })
     .catch((err) => {
       console.error('Checkout creation failed:', err);
-      setErrorMessage(err.response?.data?.error || 'Failed to initialize checkout session');
+      const backendErr = err.response?.data?.error || err.response?.data?.message || 'Failed to initialize checkout session';
+      setErrorMessage(backendErr === 'Missing or malformed Authorization header' 
+        ? 'Please Sign In first to complete checkout.' 
+        : backendErr
+      );
     });
-  }, [seatId]);
+  }, [validSeatId]);
 
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
@@ -106,7 +128,7 @@ export default function Checkout({ seatId, seatNumber, priceCents, onSuccess, on
         <div>
           <h3 className="text-lg font-bold text-white">Complete Seat Purchase</h3>
           <p className="text-xs text-zinc-400">
-            Reserving Seat <span className="text-indigo-400 font-bold">{seatNumber}</span> for ${(priceCents / 100).toFixed(2)}
+            Reserving Seat <span className="text-indigo-400 font-bold">{seatNumber}</span> for ${((priceCents || 1000) / 100).toFixed(2)}
           </p>
         </div>
 
@@ -114,7 +136,7 @@ export default function Checkout({ seatId, seatNumber, priceCents, onSuccess, on
           <div className="p-4 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs rounded-xl space-y-3">
             <p className="font-semibold">{errorMessage}</p>
             <button
-              onClick={onClose}
+              onClick={handleClose}
               className="w-full py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded-lg text-xs"
             >
               Close
@@ -125,12 +147,13 @@ export default function Checkout({ seatId, seatNumber, priceCents, onSuccess, on
             Connecting to Secure Payment Gateway...
           </div>
         ) : (
-          <Elements stripe={stripePromise} options={{ clientSecret, appearance: { theme: 'night' } }}>
+          /* key={clientSecret} forces remount when clientSecret changes, resolving the Stripe error */
+          <Elements key={clientSecret} stripe={stripePromise} options={{ clientSecret, appearance: { theme: 'night' } }}>
             <PaymentForm
               bookingId={bookingId}
-              seatId={seatId}
-              onSuccess={onSuccess}
-              onClose={onClose}
+              seatId={validSeatId}
+              onSuccess={handleSuccess}
+              onClose={handleClose}
               isProcessing={isProcessing}
               setIsProcessing={setIsProcessing}
             />
