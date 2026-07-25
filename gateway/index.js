@@ -6,10 +6,10 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 
-// Enable CORS for all incoming client connections
+// Enable CORS for frontend requests
 app.use(cors());
 
-// Authentication Middleware to protect downstream routes
+// JWT Verification Middleware for protected routes
 const verifyJWT = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -18,7 +18,7 @@ const verifyJWT = (req, res, next) => {
 
   const token = authHeader.split(' ')[1];
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'super_secret_jwt_key_change_me_in_production');
     req.headers['x-user-id'] = decoded.userId;
     req.headers['x-user-email'] = decoded.email;
     next();
@@ -27,34 +27,47 @@ const verifyJWT = (req, res, next) => {
   }
 };
 
-// 1. Auth Service Proxy (Public access - pathRewrite RESTORED)
+// 1. Auth Service Proxy
 app.use(
   '/api/auth',
   createProxyMiddleware({
     target: process.env.AUTH_SERVICE_URL || 'http://127.0.0.1:4001',
     changeOrigin: true,
-    pathRewrite: { '^/': '/api/v1/auth/' }
+    pathRewrite: {
+      '^/': '/api/v1/auth/' // Converts '/register' -> '/api/v1/auth/register'
+    },
+    onProxyReq: (proxyReq, req) => {
+      console.log(`[GATEWAY PROXY] ${req.method} ${req.originalUrl} -> ${process.env.AUTH_SERVICE_URL || 'http://127.0.0.1:4001'}${proxyReq.path}`);
+    },
+    onError: (err, req, res) => {
+      console.error('[GATEWAY ERROR] Auth Service unavailable:', err.message);
+      res.status(503).json({ error: 'Auth service is unreachable. Ensure port 4001 is running.' });
+    }
   })
 );
 
-// 2. Booking Service Proxy (Public for seats GET, Protected for locking/booking)
+// 2. Booking Service Proxy
+// 2. Booking Service Proxy
 app.use(
   '/api/booking',
   (req, res, next) => {
-    // Allow fetching seats without a token (PUBLIC)
-    if (req.method === 'GET' && req.path.includes('/seats')) {
+    // Public GET requests to view seats don't require JWT
+    if (req.method === 'GET') {
       return next();
     }
-    // Require authentication for locking/booking (PRIVATE)
+    // All other operations (reserve/lock seat) require JWT
     return verifyJWT(req, res, next);
   },
   createProxyMiddleware({
     target: process.env.BOOKING_SERVICE_URL || 'http://127.0.0.1:4002',
-    changeOrigin: true
+    changeOrigin: true,
+    pathRewrite: {
+      '^/': '/api/v1/booking/' // Rewrites /api/booking/* to /api/v1/booking/*
+    }
   })
 );
 
-// 3. Food Service Proxy (Protected)
+// 3. Food Service Proxy
 app.use(
   '/api/food',
   verifyJWT,
@@ -65,7 +78,6 @@ app.use(
   })
 );
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'API Gateway is healthy' });
 });

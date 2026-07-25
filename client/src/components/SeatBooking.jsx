@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react';
 import api from '../api';
+import Checkout from './Checkout';
+import TicketView from './TicketView';
 import { 
   Lock, 
   Clock, 
@@ -21,6 +23,10 @@ export default function SeatBooking({ token }) {
   const [error, setError] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
+  // Modal Flow States
+  const [activeCheckoutSeat, setActiveCheckoutSeat] = useState(null);
+  const [activeBookingId, setActiveBookingId] = useState(null);
+
   useEffect(() => {
     const fetchSeats = async () => {
       try {
@@ -38,20 +44,23 @@ export default function SeatBooking({ token }) {
     return () => clearInterval(interval);
   }, [refreshKey]);
 
-  const handleLockSeat = async (seatId) => {
+  const handleLockSeat = async (seat) => {
     if (!token) {
       setError('Please sign in first to lock seats');
       return;
     }
 
-    setLockingId(seatId);
+    setLockingId(seat.id);
     setError(null);
     setMessage(null);
 
     try {
-      const res = await api.post('/api/booking/lock', { seatId });
+      const res = await api.post('/api/booking/lock', { seatId: seat.id });
       setMessage(res.data.message);
       setRefreshKey((prev) => prev + 1);
+      
+      // Lock successful -> open Stripe Checkout Modal
+      setActiveCheckoutSeat(seat);
     } catch (err) {
       setError(err.response?.data?.error || 'Seat locking failed');
     } finally {
@@ -152,7 +161,7 @@ export default function SeatBooking({ token }) {
                 <button
                   key={seat.id}
                   disabled={!isAvailable || isPending}
-                  onClick={() => handleLockSeat(seat.id)}
+                  onClick={() => handleLockSeat(seat)}
                   className={`relative group p-4 rounded-xl border flex flex-col items-center justify-between gap-3 transition-all duration-200 ${
                     isAvailable
                       ? 'bg-zinc-950/80 border-white/10 hover:border-indigo-500/50 hover:bg-zinc-900/90 hover:shadow-lg hover:shadow-indigo-500/10 cursor-pointer active:scale-[0.98]'
@@ -193,6 +202,31 @@ export default function SeatBooking({ token }) {
           </div>
         )}
       </div>
+
+      {/* Stripe Payment Modal */}
+      {activeCheckoutSeat && (
+        <Checkout
+          seatId={activeCheckoutSeat.id}
+          seatNumber={activeCheckoutSeat.seat_number}
+          priceCents={activeCheckoutSeat.price_cents}
+          onClose={() => setActiveCheckoutSeat(null)}
+          onSuccess={(bookingId) => {
+            setActiveCheckoutSeat(null);
+            setActiveBookingId(bookingId);
+          }}
+        />
+      )}
+
+      {/* QR Ticket Modal */}
+      {activeBookingId && (
+        <TicketView
+          bookingId={activeBookingId}
+          onClose={() => {
+            setActiveBookingId(null);
+            setRefreshKey((prev) => prev + 1);
+          }}
+        />
+      )}
 
     </div>
   );

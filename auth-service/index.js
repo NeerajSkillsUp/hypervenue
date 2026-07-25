@@ -94,10 +94,11 @@ app.post('/api/v1/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
+    // 🔑 Generates token valid for 8 hours (configured via .env)
     const accessToken = jwt.sign(
       { userId: user.id, email: user.email },
       process.env.JWT_SECRET,
-      { expiresIn: '15m' }
+      { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
     );
 
     return res.json({
