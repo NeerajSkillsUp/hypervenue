@@ -16,23 +16,26 @@ const redis = new Redis(process.env.REDIS_URL);
 
 // 1. REGISTER ENDPOINT
 app.post('/api/v1/auth/register', async (req, res) => {
-  const { email, phoneNumber, password } = req.body;
+  const { email, phoneNumber, password, role, businessName } = req.body;
+  const assignedRole = ['customer', 'vendor', 'staff'].includes(role) ? role : 'customer';
 
   if (!email || !phoneNumber || !password) {
     return res.status(400).json({ error: 'Missing required fields' });
+  }
+  if (assignedRole === 'vendor' && !businessName) {
+    return res.status(400).json({ error: 'businessName is required for vendor accounts' });
   }
 
   try {
     const passwordHash = await bcrypt.hash(password, 10);
 
     const result = await pool.query(
-      `INSERT INTO users (email, phone_number, password_hash) VALUES ($1, $2, $3) RETURNING id, email, phone_number`,
-      [email, phoneNumber, passwordHash]
+      `INSERT INTO users (email, phone_number, password_hash, role, business_name) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, phone_number, role`,
+      [email, phoneNumber, passwordHash, assignedRole, assignedRole === 'vendor' ? businessName : null]
     );
 
     const user = result.rows[0];
 
-    // Generate 6-digit OTP & store in Redis (5 min TTL)
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await redis.set(`otp:${email}`, otp, 'EX', 300);
 
@@ -40,7 +43,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
 
     return res.status(201).json({
       message: 'User registered successfully. Verify OTP to complete registration.',
-      user: { id: user.id, email: user.email },
+      user: { id: user.id, email: user.email, role: user.role },
       debugOtp: otp
     });
   } catch (err) {
@@ -51,6 +54,38 @@ app.post('/api/v1/auth/register', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// Fire-and-report vendor provisioning call. Never blocks or fails OTP
+// verification — food-service's self-heal fallback covers us if this
+// doesn't land (service down, timeout, network blip).
+async function provisionVendorIfNeeded(user) {
+  if (user.role !== 'vendor') return;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    const resp = await fetch(`${process.env.FOOD_SERVICE_URL}/api/v1/food/internal/vendors`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-secret': process.env.INTERNAL_SERVICE_SECRET
+      },
+      body: JSON.stringify({ ownerUserId: user.id, name: user.business_name }),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    if (!resp.ok) {
+      console.error(`[VENDOR PROVISION] food-service responded ${resp.status} for user ${user.id}`);
+    } else {
+      console.log(`[VENDOR PROVISION] Vendor created for user ${user.id}`);
+    }
+  } catch (err) {
+    console.error(`[VENDOR PROVISION] Failed to reach food-service for user ${user.id}:`, err.message);
+    // Deliberately not re-thrown — see self-heal fallback in food-service.
+  }
+}
 
 // 2. VERIFY OTP ENDPOINT
 app.post('/api/v1/auth/verify-otp', async (req, res) => {
@@ -63,8 +98,13 @@ app.post('/api/v1/auth/verify-otp', async (req, res) => {
       return res.status(400).json({ error: 'Invalid or expired OTP' });
     }
 
-    await pool.query('UPDATE users SET is_verified = TRUE WHERE email = $1', [email]);
+    const result = await pool.query(
+      'UPDATE users SET is_verified = TRUE WHERE email = $1 RETURNING id, role, business_name',
+      [email]
+    );
     await redis.del(`otp:${email}`);
+
+    provisionVendorIfNeeded(result.rows[0]); // not awaited — don't hold up the response
 
     return res.json({ message: 'Account verified successfully' });
   } catch (err) {
@@ -73,7 +113,7 @@ app.post('/api/v1/auth/verify-otp', async (req, res) => {
   }
 });
 
-// 3. LOGIN ENDPOINT
+// 3. LOGIN ENDPOINT — put role in the JWT payload and the response
 app.post('/api/v1/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
@@ -94,9 +134,8 @@ app.post('/api/v1/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    // 🔑 Generates token valid for 8 hours (configured via .env)
     const accessToken = jwt.sign(
-      { userId: user.id, email: user.email },
+      { userId: user.id, email: user.email, role: user.role },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
     );
@@ -104,7 +143,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
     return res.json({
       message: 'Login successful',
       accessToken,
-      user: { id: user.id, email: user.email }
+      user: { id: user.id, email: user.email, role: user.role }
     });
   } catch (err) {
     console.error(err);

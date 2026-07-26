@@ -22,8 +22,9 @@ const setAuthHeader = (token) => {
 export default function App() {
   const [token, setToken] = useState(localStorage.getItem('token') || '');
   const [userEmail, setUserEmail] = useState(localStorage.getItem('userEmail') || '');
+  const [userRole, setUserRole] = useState(localStorage.getItem('userRole') || 'customer');
   const [activeTab, setActiveTab] = useState('seats');
-  
+
   const [selectedSeat, setSelectedSeat] = useState(() => {
     try {
       const saved = localStorage.getItem('selectedSeat');
@@ -43,12 +44,15 @@ export default function App() {
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [isRegister, setIsRegister] = useState(true);
   const [step, setStep] = useState('auth');
-  
+
   const [authEmail, setAuthEmail] = useState('');
   const [authPhone, setAuthPhone] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [authOtp, setAuthOtp] = useState('');
-  
+
+  const [authRole, setAuthRole] = useState('customer'); // 'customer' | 'vendor'
+  const [authBusinessName, setAuthBusinessName] = useState('');
+
   const [authError, setAuthError] = useState('');
   const [authMessage, setAuthMessage] = useState('');
 
@@ -57,6 +61,32 @@ export default function App() {
       setAuthHeader(token);
     }
   }, [token]);
+
+  const resetForm = () => {
+    setAuthEmail('');
+    setAuthPhone('');
+    setAuthPassword('');
+    setAuthOtp('');
+    setAuthError('');
+    setAuthMessage('');
+    setStep('auth');
+    setAuthRole('customer');
+    setAuthBusinessName('');
+  };
+
+  // Where a freshly-logged-in account should land. Vendor/staff get sent to
+  // their operational screens; everyone else stays on the normal app shell.
+  const redirectAfterLogin = (role) => {
+    if (role === 'vendor') {
+      window.location.href = '/vendor';
+      return true;
+    }
+    if (role === 'staff') {
+      window.location.href = '/scanner';
+      return true;
+    }
+    return false;
+  };
 
   const handleAuthSubmit = async (e) => {
     e.preventDefault();
@@ -69,6 +99,8 @@ export default function App() {
           email: authEmail,
           phoneNumber: authPhone,
           password: authPassword,
+          role: authRole,
+          businessName: authRole === 'vendor' ? authBusinessName : undefined,
         });
 
         if (res.data.debugOtp) {
@@ -84,13 +116,22 @@ export default function App() {
         });
 
         const jwtToken = res.data.accessToken;
-        
+        const role = res.data.user?.role || 'customer';
+
         localStorage.setItem('token', jwtToken);
         localStorage.setItem('userEmail', authEmail);
-        
+        localStorage.setItem('userRole', role);
+
         setAuthHeader(jwtToken);
         setToken(jwtToken);
         setUserEmail(authEmail);
+        setUserRole(role);
+
+        // Full navigation for vendor/staff — /vendor and /scanner are
+        // separate top-level views in this app, not SPA routes, so this
+        // is intentional rather than something to swap for client routing.
+        if (redirectAfterLogin(role)) return;
+
         setShowAuthModal(false);
         resetForm();
       }
@@ -123,22 +164,14 @@ export default function App() {
   const handleLogout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('userEmail');
+    localStorage.removeItem('userRole');
     localStorage.removeItem('selectedSeat');
     setAuthHeader(null);
     setToken('');
     setUserEmail('');
+    setUserRole('customer');
     setSelectedSeat(null);
     setFoodSeatNumber(null);
-  };
-
-  const resetForm = () => {
-    setAuthEmail('');
-    setAuthPhone('');
-    setAuthPassword('');
-    setAuthOtp('');
-    setAuthError('');
-    setAuthMessage('');
-    setStep('auth');
   };
 
   const handleSeatSelectedForCheckout = (seat) => {
@@ -169,6 +202,13 @@ export default function App() {
   };
 
   if (window.location.pathname === '/vendor') {
+    if (userRole !== 'vendor') {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-zinc-950 text-zinc-400 text-sm">
+          403 — this account isn't a vendor account.
+        </div>
+      );
+    }
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans p-6">
         <VendorDashboard token={token} />
@@ -177,6 +217,13 @@ export default function App() {
   }
 
   if (window.location.pathname === '/scanner') {
+    if (userRole !== 'staff') {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-zinc-950 text-zinc-400 text-sm">
+          403 — this account isn't staff.
+        </div>
+      );
+    }
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans p-6">
         <GateScanner />
@@ -267,7 +314,7 @@ export default function App() {
         {activeTab === 'seats' && (
           <SeatBooking token={token} onSelectSeat={handleSeatSelectedForCheckout} />
         )}
-        
+
         {activeTab === 'checkout' && selectedSeat && (
           <Checkout
             seatId={currentSeatId}
@@ -306,10 +353,10 @@ export default function App() {
               {step === 'otp' ? 'Verify OTP' : isRegister ? 'Create Account' : 'Welcome Back'}
             </h2>
             <p className="text-xs text-zinc-400 mb-4">
-              {step === 'otp' 
+              {step === 'otp'
                 ? `Enter the 6-digit code sent for ${authEmail}`
-                : isRegister 
-                  ? 'Sign up to reserve live match seats' 
+                : isRegister
+                  ? 'Sign up to reserve live match seats'
                   : 'Sign in to access your bookings'
               }
             </p>
@@ -339,6 +386,50 @@ export default function App() {
                     className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500"
                   />
                 </div>
+
+                {isRegister && (
+                  <div>
+                    <label className="block text-xs text-zinc-400 mb-1">Account Type</label>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setAuthRole('customer')}
+                        className={`flex-1 py-2 rounded-xl text-xs font-semibold transition-all ${
+                          authRole === 'customer'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-zinc-800 text-zinc-400 hover:text-white'
+                        }`}
+                      >
+                        🎟️ Fan / Customer
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAuthRole('vendor')}
+                        className={`flex-1 py-2 rounded-xl text-xs font-semibold transition-all ${
+                          authRole === 'vendor'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-zinc-800 text-zinc-400 hover:text-white'
+                        }`}
+                      >
+                        🍔 Food Vendor
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {isRegister && authRole === 'vendor' && (
+                  <div>
+                    <label className="block text-xs text-zinc-400 mb-1">Business / Stand Name</label>
+                    <input
+                      type="text"
+                      required
+                      value={authBusinessName}
+                      onChange={(e) => setAuthBusinessName(e.target.value)}
+                      placeholder="e.g. Gate 4 Nachos Co."
+                      className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                )}
 
                 {isRegister && (
                   <div>

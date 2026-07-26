@@ -90,6 +90,7 @@ io.use((socket, next) => {
   }
 });
 
+// --- Authenticated Sockets & Per-Seat / Per-Vendor Rooms ---
 io.on('connection', (socket) => {
   console.log(`Socket client connected: ${socket.id} (User: ${socket.userId})`);
 
@@ -101,9 +102,18 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('joinKitchenRoom', () => {
-    socket.join('kitchen');
-    console.log(`Socket ${socket.id} joined kitchen room`);
+  // Renamed from the old generic 'kitchen' room to a room keyed on the
+  // vendor account so one vendor's dashboard never sees another vendor's
+  // live updates. Matches VendorDashboard.jsx's emit('joinVendorRoom').
+  socket.on('joinVendorRoom', async () => {
+    try {
+      const vendor = await Vendor.findOne({ ownerUserId: socket.userId });
+      if (!vendor) return;
+      socket.join(`vendor:${vendor._id}`);
+      console.log(`Socket ${socket.id} joined room vendor:${vendor._id}`);
+    } catch (err) {
+      console.error('joinVendorRoom error:', err);
+    }
   });
 });
 
@@ -135,6 +145,39 @@ app.get(['/orders/seat/:seatNumber', '/api/food/orders/seat/:seatNumber', '/api/
   } catch (err) {
     console.error('Fetch seat orders error:', err);
     return res.status(500).json({ error: 'Failed to fetch seat orders' });
+  }
+});
+
+// Vendor-scoped orders — matches "who is this vendor account?" via x-user-id
+app.get(['/orders/vendor/my-orders', '/api/food/orders/vendor/my-orders', '/api/v1/food/orders/vendor/my-orders'], async (req, res) => {
+  const ownerUserId = req.headers['x-user-id'];
+  const role = req.headers['x-user-role'];
+
+  if (!ownerUserId) {
+    return res.status(401).json({ error: 'Missing x-user-id' });
+  }
+
+  try {
+    let vendor = await Vendor.findOne({ ownerUserId });
+
+    // Self-heal: this account is vendor-role but somehow has no Vendor doc yet
+    // (auth-service's internal call failed, food-service was down at signup
+    // time, this is an account that was promoted to vendor manually, etc).
+    // Create it lazily on first dashboard visit instead of hard-failing.
+    if (!vendor && role === 'vendor') {
+      vendor = await Vendor.create({ ownerUserId, name: 'Unnamed Stand', isActive: true });
+      console.log(`[SELF-HEAL] Created missing Vendor doc for user ${ownerUserId}`);
+    }
+
+    if (!vendor) {
+      return res.status(404).json({ error: 'No vendor account found for this user' });
+    }
+
+    const orders = await Order.find({ vendorId: vendor._id, paymentStatus: 'COMPLETED' }).sort({ createdAt: -1 });
+    return res.json({ vendorId: vendor._id, vendorName: vendor.name, orders });
+  } catch (err) {
+    console.error('Vendor orders fetch error:', err);
+    return res.status(500).json({ error: 'Failed to fetch vendor orders' });
   }
 });
 
@@ -213,8 +256,11 @@ app.post(['/confirm-dev', '/api/food/confirm-dev', '/api/v1/food/confirm-dev'], 
     await order.save();
 
     // Broadcast live order to customer seat & kitchen dashboard
+    // e.g. inside /confirm-dev, the webhook handler, and the status PATCH:
     io.to(`seat:${order.seatNumber}`).emit('orderUpdated', order);
-    io.to('kitchen').emit('newOrder', order);
+    if (order.vendorId) {
+      io.to(`vendor:${order.vendorId}`).emit(order.isNew ? 'newOrder' : 'orderUpdated', order);
+    }
 
     console.log(`✅ [DEV CONFIRM] Food Order ${order._id} paid and sent to Kitchen for Seat ${order.seatNumber}`);
     return res.json(order);
@@ -260,26 +306,65 @@ app.post('/api/v1/food/webhook', async (req, res) => {
   res.json({ received: true });
 });
 
-// 6. Vendor/Runner Order Status Update
+// 6. Vendor/Runner Order Status Update — now ownership-checked
 app.patch(['/orders/:orderId/status', '/api/food/orders/:orderId/status', '/api/v1/food/orders/:orderId/status'], async (req, res) => {
   const { status } = req.body;
+  const requestingUserId = req.headers['x-user-id'];
   const valid = ['RECEIVED', 'PREPARING', 'OUT_FOR_DELIVERY', 'DELIVERED'];
+
   if (!valid.includes(status)) {
     return res.status(400).json({ error: 'Invalid status' });
   }
 
   try {
-    const order = await Order.findByIdAndUpdate(req.params.orderId, { status }, { new: true });
+    const order = await Order.findById(req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
+    // Ownership guard: the authenticated user must own the vendor this order belongs to
+    const vendor = await Vendor.findById(order.vendorId);
+    if (!vendor || vendor.ownerUserId !== requestingUserId) {
+      return res.status(403).json({ error: 'You do not own this order' });
+    }
+
+    order.status = status;
+    await order.save();
+
     io.to(`seat:${order.seatNumber}`).emit('orderUpdated', order);
-    io.to('kitchen').emit('orderUpdated', order);
-    console.log(`Updated Order ${order._id} status to ${status} for seat ${order.seatNumber}`);
+    io.to(`vendor:${order.vendorId}`).emit('orderUpdated', order);
 
     return res.json(order);
   } catch (err) {
     console.error('Status update error:', err);
     return res.status(500).json({ error: 'Failed to update order status' });
+  }
+});
+
+// --- Internal, service-to-service only. Never exposed through the gateway. ---
+const requireInternalSecret = (req, res, next) => {
+  if (req.headers['x-internal-secret'] !== process.env.INTERNAL_SERVICE_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+};
+
+// Called by auth-service right after a vendor-role account verifies its OTP.
+// Upserted on ownerUserId so retries/duplicate calls are harmless.
+app.post('/api/v1/food/internal/vendors', requireInternalSecret, async (req, res) => {
+  const { ownerUserId, name } = req.body;
+  if (!ownerUserId) {
+    return res.status(400).json({ error: 'ownerUserId is required' });
+  }
+
+  try {
+    const vendor = await Vendor.findOneAndUpdate(
+      { ownerUserId },
+      { $setOnInsert: { name: name || 'Unnamed Stand', ownerUserId, isActive: true } },
+      { upsert: true, new: true }
+    );
+    return res.status(201).json(vendor);
+  } catch (err) {
+    console.error('Internal vendor creation error:', err);
+    return res.status(500).json({ error: 'Failed to create vendor' });
   }
 });
 

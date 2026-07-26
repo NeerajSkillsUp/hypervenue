@@ -15,11 +15,10 @@ export default function VendorDashboard({ token }) {
   useEffect(() => {
     const fetchOrders = async () => {
       try {
-        // Fetch all active orders for the kitchen
-        const res = await api.get('/api/food/orders/seat/A1');
-        setOrders(res.data);
+        const res = await api.get('/api/food/orders/vendor/my-orders');
+        setOrders(res.data.orders);
       } catch (err) {
-        console.error('Failed to fetch kitchen orders:', err);
+        console.error('Failed to fetch vendor orders:', err);
       } finally {
         setLoading(false);
       }
@@ -30,22 +29,15 @@ export default function VendorDashboard({ token }) {
     const socket = io(FOOD_SERVICE_URL, { auth: { token } });
 
     socket.on('connect', () => {
-      console.log('Vendor connected to Socket.IO');
-      socket.emit('joinVendorRoom');
+      socket.emit('joinVendorRoom'); // now actually handled server-side
     });
 
-    // Listen for new incoming orders placed by fans
     socket.on('newOrder', (newOrder) => {
-      console.log('⚡ New kitchen order received:', newOrder);
       setOrders((prev) => [newOrder, ...prev.filter(o => o._id !== newOrder._id)]);
     });
 
-    // Listen for status updates
     socket.on('orderUpdated', (updatedOrder) => {
-      console.log('🔄 Order updated:', updatedOrder);
-      setOrders((prev) =>
-        prev.map((ord) => (ord._id === updatedOrder._id ? updatedOrder : ord))
-      );
+      setOrders((prev) => prev.map((ord) => (ord._id === updatedOrder._id ? updatedOrder : ord)));
     });
 
     return () => socket.disconnect();
