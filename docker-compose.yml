@@ -10,7 +10,7 @@ services:
     ports: ["5432:5432"]
     volumes: ["auth-data:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin"]
+      test: ["CMD-SHELL", "pg_isready -U admin -d hypervenue_auth"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -24,7 +24,7 @@ services:
     ports: ["5433:5432"]
     volumes: ["booking-data:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin"]
+      test: ["CMD-SHELL", "pg_isready -U admin -d hypervenue_booking"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -37,6 +37,43 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
+  
+  auth-service:
+    build: ./auth-service
+    ports: ["4001:4001"]
+    env_file: ./auth-service/.env
+    depends_on:
+      postgres-auth:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  booking-service:
+    build: ./booking-service
+    ports: ["4002:4002"]
+    env_file: ./booking-service/.env
+    depends_on:
+      postgres-booking:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  food-service:
+    build: ./food-service
+    ports: ["4003:4003"]
+    env_file: ./food-service/.env
+    depends_on:
+      mongo-food:
+        condition: service_started
+
+  gateway:
+    build: ./gateway
+    ports: ["4000:4000"]
+    env_file: ./gateway/.env
+    depends_on:
+      - auth-service
+      - booking-service
+      - food-service
 
 volumes:
   auth-data:

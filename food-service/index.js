@@ -76,6 +76,19 @@ const orderSchema = new mongoose.Schema({
 });
 const Order = mongoose.model('Order', orderSchema);
 
+// Shared vendor lookup/self-heal helper. Used by the vendor-orders route and
+// the new vendor menu-management routes below, so both stay in sync about
+// what "this vendor account" means and neither hard-fails a legitimate
+// vendor-role user who is missing a Vendor doc for some historical reason.
+async function getOrCreateVendor(ownerUserId, role) {
+  let vendor = await Vendor.findOne({ ownerUserId });
+  if (!vendor && role === 'vendor') {
+    vendor = await Vendor.create({ ownerUserId, name: 'Unnamed Stand', isActive: true });
+    console.log(`[SELF-HEAL] Created missing Vendor doc for user ${ownerUserId}`);
+  }
+  return vendor;
+}
+
 // --- Authenticated Sockets & Per-Seat Rooms ---
 io.use((socket, next) => {
   try {
@@ -180,6 +193,142 @@ app.get(['/orders/vendor/my-orders', '/api/food/orders/vendor/my-orders', '/api/
     return res.status(500).json({ error: 'Failed to fetch vendor orders' });
   }
 });
+
+// --- Vendor Menu Management (owner-only CRUD) ---
+// Every route below requires the caller to be an authenticated vendor-role
+// user, and every write is scoped to *that* vendor's own MenuItem docs —
+// a vendor can never read or modify another stand's menu.
+const requireVendorOwnership = async (req, res, next) => {
+  const ownerUserId = req.headers['x-user-id'];
+  const role = req.headers['x-user-role'];
+
+  if (!ownerUserId) {
+    return res.status(401).json({ error: 'Missing x-user-id' });
+  }
+  if (role !== 'vendor') {
+    return res.status(403).json({ error: 'Vendor account required' });
+  }
+
+  try {
+    const vendor = await getOrCreateVendor(ownerUserId, role);
+    if (!vendor) {
+      return res.status(404).json({ error: 'No vendor account found for this user' });
+    }
+    req.vendor = vendor;
+    next();
+  } catch (err) {
+    console.error('Vendor ownership check failed:', err);
+    // Include the real Mongoose/Mongo error message (name + message only,
+    // never the stack) so a failure is self-diagnosing from the UI alone —
+    // this is a dev-scale internal tool, not a public-facing endpoint.
+    return res.status(500).json({ error: `Failed to resolve vendor account: ${err.name}: ${err.message}` });
+  }
+};
+
+// GET the vendor's full menu — including unavailable items, since the
+// vendor needs to see (and re-enable) items the public /menu endpoint hides.
+app.get(
+  ['/vendor/menu', '/api/food/vendor/menu', '/api/v1/food/vendor/menu'],
+  requireVendorOwnership,
+  async (req, res) => {
+    try {
+      const items = await MenuItem.find({ vendorId: req.vendor._id }).sort({ category: 1, name: 1 });
+      return res.json({ vendorId: req.vendor._id, vendorName: req.vendor.name, items });
+    } catch (err) {
+      console.error('Vendor menu fetch error:', err);
+      return res.status(500).json({ error: `Failed to fetch menu: ${err.name}: ${err.message}` });
+    }
+  }
+);
+
+// CREATE a menu item
+app.post(
+  ['/vendor/menu', '/api/food/vendor/menu', '/api/v1/food/vendor/menu'],
+  requireVendorOwnership,
+  async (req, res) => {
+    const { name, category, priceCents } = req.body;
+
+    if (!name || !category) {
+      return res.status(400).json({ error: 'name and category are required' });
+    }
+    if (!Number.isInteger(priceCents) || priceCents <= 0) {
+      // Money is stored as integer cents throughout HyperVenue — never accept
+      // a decimal dollar amount here, or totals will drift on the food side
+      // the same way the guide warns about for booking prices.
+      return res.status(400).json({ error: 'priceCents must be a positive integer (cents, not dollars)' });
+    }
+
+    try {
+      const item = await MenuItem.create({
+        vendorId: req.vendor._id,
+        name,
+        category,
+        priceCents,
+        isAvailable: true
+      });
+      return res.status(201).json(item);
+    } catch (err) {
+      console.error('Menu item creation error:', err);
+      return res.status(500).json({ error: `Failed to create menu item: ${err.name}: ${err.message}` });
+    }
+  }
+);
+
+// UPDATE a menu item (name/category/price and/or availability toggle)
+app.patch(
+  ['/vendor/menu/:itemId', '/api/food/vendor/menu/:itemId', '/api/v1/food/vendor/menu/:itemId'],
+  requireVendorOwnership,
+  async (req, res) => {
+    const { name, category, priceCents, isAvailable } = req.body;
+
+    try {
+      const item = await MenuItem.findById(req.params.itemId);
+      if (!item) return res.status(404).json({ error: 'Menu item not found' });
+
+      if (String(item.vendorId) !== String(req.vendor._id)) {
+        return res.status(403).json({ error: 'You do not own this menu item' });
+      }
+
+      if (name !== undefined) item.name = name;
+      if (category !== undefined) item.category = category;
+      if (priceCents !== undefined) {
+        if (!Number.isInteger(priceCents) || priceCents <= 0) {
+          return res.status(400).json({ error: 'priceCents must be a positive integer' });
+        }
+        item.priceCents = priceCents;
+      }
+      if (isAvailable !== undefined) item.isAvailable = !!isAvailable;
+
+      await item.save();
+      return res.json(item);
+    } catch (err) {
+      console.error('Menu item update error:', err);
+      return res.status(500).json({ error: `Failed to update menu item: ${err.name}: ${err.message}` });
+    }
+  }
+);
+
+// DELETE a menu item
+app.delete(
+  ['/vendor/menu/:itemId', '/api/food/vendor/menu/:itemId', '/api/v1/food/vendor/menu/:itemId'],
+  requireVendorOwnership,
+  async (req, res) => {
+    try {
+      const item = await MenuItem.findById(req.params.itemId);
+      if (!item) return res.status(404).json({ error: 'Menu item not found' });
+
+      if (String(item.vendorId) !== String(req.vendor._id)) {
+        return res.status(403).json({ error: 'You do not own this menu item' });
+      }
+
+      await item.deleteOne();
+      return res.json({ deleted: true, itemId: req.params.itemId });
+    } catch (err) {
+      console.error('Menu item delete error:', err);
+      return res.status(500).json({ error: `Failed to delete menu item: ${err.name}: ${err.message}` });
+    }
+  }
+);
 
 // 3. Initiate Food Order & Stripe PaymentIntent
 app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], async (req, res) => {
