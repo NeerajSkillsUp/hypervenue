@@ -25,7 +25,8 @@ const verifyJWT = (req, res, next) => {
 
   const token = authHeader.split(' ')[1];
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'super_secret_jwt_key_change_me_in_production');
+    if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET is not set');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.headers['x-user-id'] = decoded.userId;
     req.headers['x-user-email'] = decoded.email;
     req.headers['x-user-role'] = decoded.role || 'customer'; // NEW

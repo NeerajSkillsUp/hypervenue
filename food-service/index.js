@@ -29,7 +29,7 @@ app.use((req, res, next) => {
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST', 'PATCH'] }
+  cors: { origin: process.env.CLIENT_URL, methods: ['GET', 'POST', 'PATCH'] }
 });
 
 // Connect MongoDB
@@ -95,7 +95,8 @@ io.use((socket, next) => {
     const token = socket.handshake.auth.token;
     if (!token) return next(new Error('unauthorized'));
     
-    const payload = jwt.verify(token, process.env.JWT_SECRET || 'supersecretjwtkey');
+    if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET is not set');
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
     socket.userId = payload.userId;
     next();
   } catch (err) {
