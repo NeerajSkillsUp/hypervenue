@@ -571,13 +571,21 @@ app.post(['/confirm-dev', '/api/food/confirm-dev', '/api/v1/food/confirm-dev'], 
 // 5. Stripe Webhook Endpoint
 app.post('/api/v1/food/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
+  const webhookSecret =
+    process.env.STRIPE_FOOD_WEBHOOK_SECRET || process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!webhookSecret) {
+    console.error('Food Stripe webhook secret is not configured');
+    return res.status(500).json({ error: 'Webhook not configured' });
+  }
+
   let event;
 
   try {
     event = stripe.webhooks.constructEvent(
       req.body,
       sig,
-      process.env.STRIPE_FOOD_WEBHOOK_SECRET || process.env.STRIPE_WEBHOOK_SECRET
+      webhookSecret
     );
   } catch (err) {
     console.error('Webhook signature verification failed:', err.message);
@@ -585,23 +593,81 @@ app.post('/api/v1/food/webhook', async (req, res) => {
   }
 
   if (event.type === 'payment_intent.succeeded') {
-    const { orderId } = event.data.object.metadata;
+    const paymentIntent = event.data.object;
+    const { orderId } = paymentIntent.metadata || {};
+
+    if (!orderId || !mongoose.Types.ObjectId.isValid(orderId)) {
+      console.error('Webhook received invalid orderId metadata');
+      return res.status(400).json({ error: 'Invalid orderId metadata' });
+    }
+
     try {
       const order = await Order.findById(orderId);
-      if (order) {
-        order.paymentStatus = 'COMPLETED';
-        await order.save();
 
-        io.to(`user:${order.userId}`).emit('orderUpdated', order);
-        io.to('kitchen').emit('newOrder', order);
-        console.log(`✅ [STRIPE WEBHOOK] Food Order ${order._id} paid & sent to kitchen`);
+      if (!order) {
+        console.error(`Webhook order not found: ${orderId}`);
+        return res.status(404).json({ error: 'Order not found' });
       }
+
+      // The Stripe PaymentIntent must belong to this exact order.
+      if (!order.paymentIntentId || order.paymentIntentId !== paymentIntent.id) {
+        console.error(
+          `Webhook PaymentIntent mismatch for order ${order._id}`
+        );
+        return res.status(400).json({ error: 'PaymentIntent mismatch' });
+      }
+
+      // Stripe may deliver the same event more than once.
+      if (order.paymentStatus === 'COMPLETED') {
+        console.log(
+          `Stripe webhook replay ignored for completed food order ${order._id}`
+        );
+        return res.json({ received: true });
+      }
+
+      if (order.paymentStatus !== 'PENDING') {
+        console.error(
+          `Unexpected payment status ${order.paymentStatus} for food order ${order._id}`
+        );
+        return res.status(409).json({ error: 'Invalid payment state' });
+      }
+
+      const updatedOrder = await Order.findOneAndUpdate(
+        {
+          _id: order._id,
+          paymentIntentId: paymentIntent.id,
+          paymentStatus: 'PENDING'
+        },
+        {
+          $set: { paymentStatus: 'COMPLETED' }
+        },
+        { new: true }
+      );
+
+      // Another duplicate/concurrent webhook may have completed it first.
+      if (!updatedOrder) {
+        const currentOrder = await Order.findById(order._id);
+
+        if (currentOrder?.paymentStatus === 'COMPLETED') {
+          return res.json({ received: true });
+        }
+
+        return res.status(409).json({ error: 'Payment state changed' });
+      }
+
+      io.to(`user:${updatedOrder.userId}`).emit('orderUpdated', updatedOrder);
+      io.to('kitchen').emit('newOrder', updatedOrder);
+
+      console.log(
+        `Food Order ${updatedOrder._id} paid & sent to kitchen`
+      );
     } catch (err) {
       console.error('Webhook DB update failed:', err);
+      return res.status(500).json({ error: 'Failed to process webhook' });
     }
   }
 
-  res.json({ received: true });
+  return res.json({ received: true });
 });
 
 // 6. Vendor/Runner Order Status Update — now ownership-checked
