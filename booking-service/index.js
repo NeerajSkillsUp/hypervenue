@@ -491,6 +491,10 @@ app.post(
     let event;
 
     try {
+      if (!process.env.STRIPE_WEBHOOK_SECRET) {
+        throw new Error('STRIPE_WEBHOOK_SECRET is not configured');
+      }
+
       event = stripe.webhooks.constructEvent(
         req.body,
         sig,
@@ -502,35 +506,120 @@ app.post(
     }
 
     if (event.type === 'payment_intent.succeeded') {
-      const { bookingId, seatId } = event.data.object.metadata;
+      const paymentIntent = event.data.object;
+      const { bookingId, seatId } = paymentIntent.metadata || {};
+
+      // Validate Stripe metadata before using it in database queries.
+      if (!isValidUUID(bookingId) || !isValidUUID(seatId)) {
+        console.error('Webhook contains invalid booking or seat metadata');
+        return res.status(400).json({
+          error: 'Invalid booking or seat metadata'
+        });
+      }
+
       const client = await pool.connect();
 
       try {
         await client.query('BEGIN');
 
-        // Generate QR Code payload
-        const qrPayload = JSON.stringify({ bookingId, seatId, ts: Date.now() });
+        // Lock the booking row so concurrent/duplicate webhook deliveries
+        // cannot both transition the same booking.
+        const bookingResult = await client.query(
+          `SELECT id, seat_id, payment_status
+           FROM bookings
+           WHERE id = $1
+           FOR UPDATE`,
+          [bookingId]
+        );
+
+        if (bookingResult.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({
+            error: 'Booking not found'
+          });
+        }
+
+        const booking = bookingResult.rows[0];
+
+        // Stripe metadata must agree with the booking stored in our DB.
+        if (booking.seat_id !== seatId) {
+          await client.query('ROLLBACK');
+          console.error(
+            `Webhook seat mismatch for booking ${bookingId}: ` +
+            `metadata=${seatId}, db=${booking.seat_id}`
+          );
+
+          return res.status(400).json({
+            error: 'Booking seat does not match webhook metadata'
+          });
+        }
+
+        // Duplicate delivery of an already-processed success event is safe.
+        if (booking.payment_status === 'COMPLETED') {
+          await client.query('COMMIT');
+
+          console.log(
+            `ℹ️ Booking ${bookingId} already completed; duplicate webhook ignored`
+          );
+
+          return res.json({ received: true });
+        }
+
+        // Only a pending booking may transition to completed.
+        if (booking.payment_status !== 'PENDING') {
+          await client.query('ROLLBACK');
+
+          console.error(
+            `Unexpected payment status for booking ${bookingId}: ` +
+            `${booking.payment_status}`
+          );
+
+          return res.status(409).json({
+            error: 'Booking is not awaiting payment'
+          });
+        }
+
+        // Generate QR Code payload only when completing the booking.
+        const qrPayload = JSON.stringify({
+          bookingId,
+          seatId,
+          ts: Date.now()
+        });
+
         const qrDataUrl = await QRCode.toDataURL(qrPayload);
 
-        // Mark booking COMPLETED & save QR code
+        // Mark booking COMPLETED & save QR code.
         await client.query(
-          `UPDATE bookings SET payment_status = 'COMPLETED', qr_code_payload = $1 WHERE id = $2`,
+          `UPDATE bookings
+           SET payment_status = 'COMPLETED',
+               qr_code_payload = $1
+           WHERE id = $2
+             AND payment_status = 'PENDING'`,
           [qrDataUrl, bookingId]
         );
 
-        // Mark seat permanently BOOKED
-        await client.query(`UPDATE seats SET status = 'BOOKED' WHERE id = $1`, [seatId]);
+        // Mark seat permanently BOOKED.
+        await client.query(
+          `UPDATE seats
+           SET status = 'BOOKED'
+           WHERE id = $1`,
+          [seatId]
+        );
 
         await client.query('COMMIT');
 
-        // Clear temporary Redis lock
+        // Clear temporary Redis lock.
         if (redis) {
           await redis.del(`seat_hold:${seatId}`);
         }
-        console.log(`✅ Booking ${bookingId} completed & seat ${seatId} booked!`);
+
+        console.log(
+          `✅ Booking ${bookingId} completed & seat ${seatId} booked!`
+        );
       } catch (err) {
         await client.query('ROLLBACK');
         console.error('Webhook DB update failed:', err);
+
         return res.status(500).json({
           error: 'Webhook processing failed'
         });
@@ -539,7 +628,7 @@ app.post(
       }
     }
 
-    res.json({ received: true });
+    return res.json({ received: true });
   }
 );
 
