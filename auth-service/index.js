@@ -15,6 +15,20 @@ app.use(express.json());
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const redis = new Redis(process.env.REDIS_URL);
 
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_ATTEMPT_WINDOW_SECONDS = 15 * 60;
+
+async function recordLoginFailure(email) {
+  const key = `login_attempts:${email}`;
+  const attempts = await redis.incr(key);
+
+  if (attempts === 1) {
+    await redis.expire(key, LOGIN_ATTEMPT_WINDOW_SECONDS);
+  }
+
+  return attempts;
+}
+
 // 1. REGISTER ENDPOINT
 app.post('/api/v1/auth/register', async (req, res) => {
   const { email, phoneNumber, password, role, businessName } = req.body;
@@ -146,7 +160,16 @@ app.post('/api/v1/auth/login', async (req, res) => {
 
   try {
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+
     if (result.rows.length === 0) {
+      const attempts = await recordLoginFailure(email);
+
+      if (attempts >= LOGIN_MAX_ATTEMPTS) {
+        return res.status(429).json({
+          error: 'Too many login attempts. Please try again later.'
+        });
+      }
+
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
@@ -157,9 +180,20 @@ app.post('/api/v1/auth/login', async (req, res) => {
     }
 
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
+
     if (!isValidPassword) {
+      const attempts = await recordLoginFailure(email);
+
+      if (attempts >= LOGIN_MAX_ATTEMPTS) {
+        return res.status(429).json({
+          error: 'Too many login attempts. Please try again later.'
+        });
+      }
+
       return res.status(401).json({ error: 'Invalid email or password' });
     }
+
+    await redis.del(`login_attempts:${email}`);
 
     const accessToken = jwt.sign(
       { userId: user.id, email: user.email, role: user.role },
