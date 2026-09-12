@@ -293,10 +293,8 @@ app.post(['/checkout', '/api/booking/checkout', '/api/v1/booking/checkout'],veri
     if (existingResult.rows.length > 0) {
       const existingBooking = existingResult.rows[0];
 
-      if (existingBooking.user_id !== userId) {
-        return res.status(409).json({
-          error: 'Idempotency key has already been used'
-        });
+      if (String(existingBooking.user_id) !== String(userId)) {
+        return res.status(409).json({ error: 'Idempotency key has already been used' });
       }
 
       if (existingBooking.seat_id !== seatId) {
@@ -342,7 +340,7 @@ app.post(['/checkout', '/api/booking/checkout', '/api/v1/booking/checkout'],veri
     // No existing booking: the request must own the temporary seat hold.
     const holdOwner = await redis.get(`seat_hold:${seatId}`);
 
-    if (holdOwner !== userId) {
+    if (holdOwner !== String(userId)) {
       return res.status(409).json({
         error: 'Seat hold is missing or belongs to another user'
       });
@@ -379,10 +377,8 @@ app.post(['/checkout', '/api/booking/checkout', '/api/v1/booking/checkout'],veri
         if (existing.rows.length > 0) {
           const existingBooking = existing.rows[0];
 
-          if (existingBooking.user_id !== userId) {
-            return res.status(409).json({
-              error: 'Idempotency key has already been used'
-            });
+          if (String(existingBooking.user_id) !== String(userId)) {
+            return res.status(409).json({ error: 'Idempotency key has already been used' });
           }
 
           if (existingBooking.seat_id !== seatId) {
