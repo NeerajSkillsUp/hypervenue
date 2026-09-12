@@ -1,4 +1,5 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -41,7 +42,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
 
     const user = result.rows[0];
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = crypto.randomInt(100000, 1000000).toString();
     await redis.set(`otp:${email}`, otp, 'EX', 300);
 
     console.log(`[DEMO ONLY] OTP for ${email} is: ${otp}`);
@@ -99,7 +100,26 @@ app.post('/api/v1/auth/verify-otp', async (req, res) => {
   try {
     const storedOtp = await redis.get(`otp:${email}`);
 
-    if (!storedOtp || storedOtp !== otp) {
+    if (!storedOtp) {
+      return res.status(400).json({ error: 'Invalid or expired OTP' });
+    }
+
+    if (storedOtp !== otp) {
+      const attemptsKey = `otp_attempts:${email}`;
+      const attempts = await redis.incr(attemptsKey);
+
+      if (attempts === 1) {
+        await redis.expire(attemptsKey, 300);
+      }
+
+      if (attempts >= 5) {
+        await redis.del(`otp:${email}`);
+        await redis.del(attemptsKey);
+        return res.status(429).json({
+          error: 'Too many invalid OTP attempts. Please register again.'
+        });
+      }
+
       return res.status(400).json({ error: 'Invalid or expired OTP' });
     }
 
@@ -107,7 +127,9 @@ app.post('/api/v1/auth/verify-otp', async (req, res) => {
       'UPDATE users SET is_verified = TRUE WHERE email = $1 RETURNING id, role, business_name',
       [email]
     );
+
     await redis.del(`otp:${email}`);
+    await redis.del(`otp_attempts:${email}`);
 
     provisionVendorIfNeeded(result.rows[0]); // not awaited — don't hold up the response
 
