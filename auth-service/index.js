@@ -17,7 +17,12 @@ const redis = new Redis(process.env.REDIS_URL);
 // 1. REGISTER ENDPOINT
 app.post('/api/v1/auth/register', async (req, res) => {
   const { email, phoneNumber, password, role, businessName } = req.body;
-  const assignedRole = ['customer', 'vendor', 'staff'].includes(role) ? role : 'customer';
+  if (role === 'staff') {
+    return res.status(403).json({
+      error: 'Staff accounts cannot be self-registered'
+    });
+  }
+  const assignedRole = ['customer', 'vendor'].includes(role) ? role : 'customer';
 
   if (!email || !phoneNumber || !password) {
     return res.status(400).json({ error: 'Missing required fields' });

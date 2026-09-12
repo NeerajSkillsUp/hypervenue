@@ -6,7 +6,13 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
-app.use(cors());
+
+const allowedOrigin = process.env.CLIENT_URL;
+
+app.use(cors({
+  origin: allowedOrigin,
+  credentials: true
+}));
 
 // Protects Auth's login/register endpoints from brute-forcing
 const authLimiter = rateLimit({
@@ -54,25 +60,37 @@ app.use(
   })
 );
 
-// ...booking proxy unchanged...
 // 2. Booking Service Proxy
 app.use(
   '/api/booking',
   (req, res, next) => {
     const path = req.path.replace(/\/+$/, '') || '/';
 
-    if (path === '/my-tickets') {
+    // Seat availability is intentionally public.
+    // The actual booking/locking operations remain protected.
+    if (req.method === 'GET' && path.includes('/events/') && path.endsWith('/seats')) {
+      return next();
+    }
+
+    // Every other Booking GET requires authentication.
+    if (req.method === 'GET') {
       return verifyJWT(req, res, next);
     }
 
+    // Check-in is a staff-only operation.
     if (req.method === 'POST' && path === '/checkin') {
-      return next();
+      return verifyJWT(req, res, () => {
+        if (req.headers['x-user-role'] !== 'staff') {
+          return res.status(403).json({
+            error: 'Staff access required'
+          });
+        }
+
+        next();
+      });
     }
 
-    if (req.method === 'GET') {
-      return next();
-    }
-
+    // All other Booking write operations require authentication.
     return verifyJWT(req, res, next);
   },
   createProxyMiddleware({
@@ -91,7 +109,15 @@ app.use('/api/food/internal', (req, res) => {
 // 3. Food Service Proxy
 app.use(
   '/api/food',
-  verifyJWT,
+  (req, res, next) => {
+    // Public food menu
+    if (req.method === 'GET' && req.path === '/menu') {
+      return next();
+    }
+
+    // All other Food Service routes require authentication
+    return verifyJWT(req, res, next);
+  },
   createProxyMiddleware({
     target: process.env.FOOD_SERVICE_URL || 'http://127.0.0.1:4003',
     changeOrigin: true,

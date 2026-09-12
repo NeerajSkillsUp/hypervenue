@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 const QRCode = require('qrcode');
@@ -9,6 +10,50 @@ const { v4: uuidv4 } = require('uuid');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
+const verifyJWT = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      error: 'Missing or malformed Authorization header'
+    });
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  try {
+    if (!process.env.JWT_SECRET) {
+      throw new Error('JWT_SECRET is not set');
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    req.user = {
+      userId: decoded.userId,
+      email: decoded.email,
+      role: decoded.role || 'customer'
+    };
+
+    next();
+  } catch (err) {
+    return res.status(401).json({
+      error: 'Invalid or expired token'
+    });
+  }
+};
+
+const requireRole = (role) => {
+  return (req, res, next) => {
+    if (!req.user || req.user.role !== role) {
+      return res.status(403).json({
+        error: `${role} access required`
+      });
+    }
+
+    next();
+  };
+};
+
 app.use(cors());
 
 // Handle raw body for Stripe webhooks vs JSON for standard endpoints
@@ -75,7 +120,8 @@ app.get(
     '/tickets/:bookingId', 
     '/api/booking/tickets/:bookingId',
     '/api/v1/booking/tickets/:bookingId'
-  ], 
+  ],
+  verifyJWT,
   async (req, res) => {
     const { bookingId } = req.params;
 
@@ -85,7 +131,7 @@ app.get(
     }
 
     try {
-      const result = await pool.query('SELECT * FROM bookings WHERE id = $1', [bookingId]);
+      const result = await pool.query('SELECT * FROM bookings WHERE id = $1 AND user_id = $2', [bookingId, req.user.userId]);
       if (result.rows.length === 0) {
         return res.status(404).json({ error: 'Ticket not found' });
       }
@@ -105,8 +151,9 @@ app.get(
     '/api/booking/my-tickets',
     '/api/v1/booking/my-tickets'
   ],
+  verifyJWT,
   async (req, res) => {
-    const userId = req.headers['x-user-id'];
+    const userId = req.user.userId;
 
     if (!userId) {
       return res.status(401).json({ error: 'Missing or malformed Authorization header' });
@@ -130,7 +177,7 @@ app.get(
 );
 
 // 3. GATE SCANNER CHECK-IN
-app.post(['/checkin', '/api/booking/checkin', '/api/v1/booking/checkin'], async (req, res) => {
+app.post(['/checkin', '/api/booking/checkin', '/api/v1/booking/checkin'],verifyJWT,requireRole('staff'), async (req, res) => {
   const { bookingId } = req.body;
 
   if (!isValidUUID(bookingId)) {
@@ -168,13 +215,13 @@ app.post(['/checkin', '/api/booking/checkin', '/api/v1/booking/checkin'], async 
 
 // 4. ATOMIC SEAT LOCK
 app.post(
-  ['/lock', '/api/booking/lock', '/api/v1/booking/lock'], 
+  ['/lock', '/api/booking/lock', '/api/v1/booking/lock'],verifyJWT,
   async (req, res) => {
     const { seatId } = req.body;
-    const userId = req.headers['x-user-id'] || 'test-user-id';
+    const userId = req.user.userId;
 
-    if (!seatId) {
-      return res.status(400).json({ error: 'seatId is required' });
+    if (!isValidUUID(seatId)) {
+      return res.status(400).json({ error: 'A valid Seat UUID is required' });
     }
 
     const client = await pool.connect();
@@ -224,16 +271,88 @@ app.post(
 );
 
 // 5. PAYMENT CHECKOUT ENDPOINT (Fixed Idempotency)
-app.post(['/checkout', '/api/booking/checkout', '/api/v1/booking/checkout'], async (req, res) => {
+app.post(['/checkout', '/api/booking/checkout', '/api/v1/booking/checkout'],verifyJWT, async (req, res) => {
   const { seatId, idempotencyKey } = req.body;
-  const userId = req.headers['x-user-id'] || 'demo-user-123';
+  const userId = req.user.userId;
 
-  if (!seatId || !idempotencyKey) {
-    return res.status(400).json({ error: 'seatId and idempotencyKey are required' });
+  if (!isValidUUID(seatId)) {
+    return res.status(400).json({ error: 'A valid Seat UUID is required' });
+  }
+
+  if (!idempotencyKey) {
+    return res.status(400).json({ error: 'idempotencyKey is required' });
   }
 
   try {
-    const seatResult = await pool.query('SELECT price_cents FROM seats WHERE id = $1', [seatId]);
+    // First check whether this request already created a booking.
+    const existingResult = await pool.query(
+      'SELECT * FROM bookings WHERE idempotency_key = $1',
+      [idempotencyKey]
+    );
+
+    if (existingResult.rows.length > 0) {
+      const existingBooking = existingResult.rows[0];
+
+      if (existingBooking.user_id !== userId) {
+        return res.status(409).json({
+          error: 'Idempotency key has already been used'
+        });
+      }
+
+      if (existingBooking.seat_id !== seatId) {
+        return res.status(409).json({
+          error: 'Idempotency key was previously used for a different seat'
+        });
+      }
+
+      // Existing booking is already associated with this idempotency key.
+      // Stripe receives the same idempotency key, making the retry safe.
+      const seatResult = await pool.query(
+        'SELECT price_cents FROM seats WHERE id = $1',
+        [seatId]
+      );
+
+      if (seatResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Seat not found' });
+      }
+
+      const { price_cents } = seatResult.rows[0];
+
+      const paymentIntent = await stripe.paymentIntents.create(
+        {
+          amount: price_cents,
+          currency: 'usd',
+          metadata: {
+            bookingId: existingBooking.id,
+            seatId,
+            userId
+          }
+        },
+        {
+          idempotencyKey
+        }
+      );
+
+      return res.status(201).json({
+        bookingId: existingBooking.id,
+        clientSecret: paymentIntent.client_secret
+      });
+    }
+
+    // No existing booking: the request must own the temporary seat hold.
+    const holdOwner = await redis.get(`seat_hold:${seatId}`);
+
+    if (holdOwner !== userId) {
+      return res.status(409).json({
+        error: 'Seat hold is missing or belongs to another user'
+      });
+    }
+
+    const seatResult = await pool.query(
+      'SELECT price_cents FROM seats WHERE id = $1',
+      [seatId]
+    );
+
     if (seatResult.rows.length === 0) {
       return res.status(404).json({ error: 'Seat not found' });
     }
@@ -242,18 +361,37 @@ app.post(['/checkout', '/api/booking/checkout', '/api/v1/booking/checkout'], asy
     let booking;
 
     try {
-      // Create pending booking row in database
+      // Create pending booking row in database.
       const bookingResult = await pool.query(
         'INSERT INTO bookings (user_id, seat_id, idempotency_key) VALUES ($1, $2, $3) RETURNING *',
         [userId, seatId, idempotencyKey]
       );
       booking = bookingResult.rows[0];
     } catch (dbErr) {
-      // Handles duplicate submission/React StrictMode double invocation (code 23505)
+      // Handles a race where another request creates the booking
+      // between our lookup and INSERT.
       if (dbErr.code === '23505') {
-        const existing = await pool.query('SELECT * FROM bookings WHERE idempotency_key = $1', [idempotencyKey]);
+        const existing = await pool.query(
+          'SELECT * FROM bookings WHERE idempotency_key = $1',
+          [idempotencyKey]
+        );
+
         if (existing.rows.length > 0) {
-          booking = existing.rows[0];
+          const existingBooking = existing.rows[0];
+
+          if (existingBooking.user_id !== userId) {
+            return res.status(409).json({
+              error: 'Idempotency key has already been used'
+            });
+          }
+
+          if (existingBooking.seat_id !== seatId) {
+            return res.status(409).json({
+              error: 'Idempotency key was previously used for a different seat'
+            });
+          }
+
+          booking = existingBooking;
         } else {
           throw dbErr;
         }
@@ -262,16 +400,21 @@ app.post(['/checkout', '/api/booking/checkout', '/api/v1/booking/checkout'], asy
       }
     }
 
-    // Always create Stripe PaymentIntent and return clientSecret
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: price_cents,
-      currency: 'usd',
-      metadata: {
-        bookingId: booking.id,
-        seatId: seatId,
-        userId: userId
+    // Create Stripe PaymentIntent using the same idempotency key.
+    const paymentIntent = await stripe.paymentIntents.create(
+      {
+        amount: price_cents,
+        currency: 'usd',
+        metadata: {
+          bookingId: booking.id,
+          seatId: seatId,
+          userId: userId
+        }
+      },
+      {
+        idempotencyKey
       }
-    });
+    );
 
     return res.status(201).json({
       bookingId: booking.id,
@@ -286,6 +429,7 @@ app.post(['/checkout', '/api/booking/checkout', '/api/v1/booking/checkout'], asy
 // 6. DIRECT DEV CONFIRMATION ENDPOINT (Local Development Fallback)
 app.post(
   ['/confirm-dev', '/api/booking/confirm-dev', '/api/v1/booking/confirm-dev'],
+  verifyJWT,
   async (req, res) => {
     const { bookingId, seatId } = req.body;
 
@@ -303,10 +447,22 @@ app.post(
       const qrDataUrl = await QRCode.toDataURL(qrPayload);
 
       // 2. Mark booking COMPLETED & save QR code
-      await client.query(
-        `UPDATE bookings SET payment_status = 'COMPLETED', qr_code_payload = $1 WHERE id = $2`,
-        [qrDataUrl, bookingId]
+      const updateResult = await client.query(
+        `UPDATE bookings
+        SET payment_status = 'COMPLETED', qr_code_payload = $1
+        WHERE id = $2
+          AND user_id = $3
+          AND seat_id = $4
+          AND payment_status = 'PENDING'`,
+        [qrDataUrl, bookingId, req.user.userId, seatId]
       );
+
+      if (updateResult.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({
+          error: 'Booking not found, not owned by user, or already completed'
+        });
+      }
 
       // 3. Mark seat permanently BOOKED
       await client.query(`UPDATE seats SET status = 'BOOKED' WHERE id = $1`, [seatId]);
@@ -379,6 +535,9 @@ app.post(
       } catch (err) {
         await client.query('ROLLBACK');
         console.error('Webhook DB update failed:', err);
+        return res.status(500).json({
+          error: 'Webhook processing failed'
+        });
       } finally {
         client.release();
       }

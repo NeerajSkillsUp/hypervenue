@@ -18,6 +18,43 @@ const stripe = new Stripe(stripeKey || 'sk_test_mock');
 const app = express();
 app.use(cors());
 
+const verifyJWT = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or malformed Authorization header' });
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  try {
+    if (!process.env.JWT_SECRET) {
+      throw new Error('JWT_SECRET is not set');
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    req.user = {
+      userId: decoded.userId,
+      email: decoded.email,
+      role: decoded.role || 'customer'
+    };
+
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+};
+
+const requireRole = (role) => {
+  return (req, res, next) => {
+    if (!req.user || req.user.role !== role) {
+      return res.status(403).json({ error: `${role} role required` });
+    }
+    next();
+  };
+};
+
 // Handle raw body for Stripe webhook vs JSON for standard routes
 app.use((req, res, next) => {
   if (req.originalUrl === '/api/v1/food/webhook') {
@@ -108,12 +145,11 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
   console.log(`Socket client connected: ${socket.id} (User: ${socket.userId})`);
 
-  socket.on('joinSeatRoom', ({ seatNumber }) => {
-    if (seatNumber) {
-      const room = `seat:${seatNumber.toUpperCase().trim()}`;
-      socket.join(room);
-      console.log(`Socket ${socket.id} joined room ${room}`);
-    }
+  socket.on('joinSeatRoom', () => {
+    const room = `user:${socket.userId}`;
+    socket.join(room);
+
+    console.log(`Socket ${socket.id} joined user room ${room}`);
   });
 
   // Renamed from the old generic 'kitchen' room to a room keyed on the
@@ -142,70 +178,102 @@ app.get(['/menu', '/api/food/menu', '/api/v1/food/menu'], async (req, res) => {
 });
 
 // 2. Fetch Kitchen Active Orders (Only paid/completed orders)
-app.get(['/kitchen/orders', '/api/food/kitchen/orders', '/api/v1/food/kitchen/orders'], async (req, res) => {
+app.get(['/kitchen/orders', '/api/food/kitchen/orders', '/api/v1/food/kitchen/orders'], verifyJWT, requireRole('vendor'), async (req, res) => {
   try {
-    const orders = await Order.find({ paymentStatus: 'COMPLETED' }).sort({ createdAt: -1 });
+    const ownerUserId = req.user.userId;
+
+    const vendor = await Vendor.findOne({ ownerUserId });
+
+    if (!vendor) {
+      return res.status(404).json({ error: 'No vendor account found for this user' });
+    }
+
+    const orders = await Order.find({
+      vendorId: vendor._id,
+      paymentStatus: 'COMPLETED'
+    }).sort({ createdAt: -1 });
+
     return res.json(orders);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch kitchen orders' });
   }
 });
 
-app.get(['/orders/seat/:seatNumber', '/api/food/orders/seat/:seatNumber', '/api/v1/food/orders/seat/:seatNumber'], async (req, res) => {
-  try {
-    const seatNumber = req.params.seatNumber.toUpperCase().trim();
-    const orders = await Order.find({ seatNumber, paymentStatus: 'COMPLETED' }).sort({ createdAt: -1 });
-    return res.json(orders);
-  } catch (err) {
-    console.error('Fetch seat orders error:', err);
-    return res.status(500).json({ error: 'Failed to fetch seat orders' });
+app.get(
+  ['/orders/seat/:seatNumber', '/api/food/orders/seat/:seatNumber', '/api/v1/food/orders/seat/:seatNumber'],
+  verifyJWT,
+  async (req, res) => {
+    try {
+      const seatNumber = req.params.seatNumber.toUpperCase().trim();
+
+      const orders = await Order.find({
+        userId: req.user.userId,
+        seatNumber,
+        paymentStatus: 'COMPLETED'
+      }).sort({ createdAt: -1 });
+
+      return res.json(orders);
+    } catch (err) {
+      console.error('Fetch seat orders error:', err);
+      return res.status(500).json({ error: 'Failed to fetch seat orders' });
+    }
   }
-});
+);
 
 // Vendor-scoped orders — matches "who is this vendor account?" via x-user-id
-app.get(['/orders/vendor/my-orders', '/api/food/orders/vendor/my-orders', '/api/v1/food/orders/vendor/my-orders'], async (req, res) => {
-  const ownerUserId = req.headers['x-user-id'];
-  const role = req.headers['x-user-role'];
+app.get(
+  ['/orders/vendor/my-orders', '/api/food/orders/vendor/my-orders', '/api/v1/food/orders/vendor/my-orders'],
+  verifyJWT,
+  requireRole('vendor'),
+  async (req, res) => {
+    const ownerUserId = req.user.userId;
 
-  if (!ownerUserId) {
-    return res.status(401).json({ error: 'Missing x-user-id' });
-  }
+    try {
+      let vendor = await Vendor.findOne({ ownerUserId });
 
-  try {
-    let vendor = await Vendor.findOne({ ownerUserId });
+      // Self-heal: this account is vendor-role but somehow has no Vendor doc yet
+      // (auth-service's internal call failed, food-service was down at signup
+      // time, this is an account that was promoted to vendor manually, etc).
+      // Create it lazily on first dashboard visit instead of hard-failing.
+      if (!vendor) {
+        vendor = await Vendor.create({
+          ownerUserId,
+          name: 'Unnamed Stand',
+          isActive: true
+        });
 
-    // Self-heal: this account is vendor-role but somehow has no Vendor doc yet
-    // (auth-service's internal call failed, food-service was down at signup
-    // time, this is an account that was promoted to vendor manually, etc).
-    // Create it lazily on first dashboard visit instead of hard-failing.
-    if (!vendor && role === 'vendor') {
-      vendor = await Vendor.create({ ownerUserId, name: 'Unnamed Stand', isActive: true });
-      console.log(`[SELF-HEAL] Created missing Vendor doc for user ${ownerUserId}`);
+        console.log(`[SELF-HEAL] Created missing Vendor doc for user ${ownerUserId}`);
+      }
+
+      if (!vendor) {
+        return res.status(404).json({ error: 'No vendor account found for this user' });
+      }
+
+      const orders = await Order.find({
+        vendorId: vendor._id,
+        paymentStatus: 'COMPLETED'
+      }).sort({ createdAt: -1 });
+
+      return res.json({
+        vendorId: vendor._id,
+        vendorName: vendor.name,
+        orders
+      });
+    } catch (err) {
+      console.error('Vendor orders fetch error:', err);
+      return res.status(500).json({ error: 'Failed to fetch vendor orders' });
     }
-
-    if (!vendor) {
-      return res.status(404).json({ error: 'No vendor account found for this user' });
-    }
-
-    const orders = await Order.find({ vendorId: vendor._id, paymentStatus: 'COMPLETED' }).sort({ createdAt: -1 });
-    return res.json({ vendorId: vendor._id, vendorName: vendor.name, orders });
-  } catch (err) {
-    console.error('Vendor orders fetch error:', err);
-    return res.status(500).json({ error: 'Failed to fetch vendor orders' });
   }
-});
+);
 
 // --- Vendor Menu Management (owner-only CRUD) ---
 // Every route below requires the caller to be an authenticated vendor-role
 // user, and every write is scoped to *that* vendor's own MenuItem docs —
 // a vendor can never read or modify another stand's menu.
 const requireVendorOwnership = async (req, res, next) => {
-  const ownerUserId = req.headers['x-user-id'];
-  const role = req.headers['x-user-role'];
+  const ownerUserId = req.user.userId;
+  const role = req.user.role;
 
-  if (!ownerUserId) {
-    return res.status(401).json({ error: 'Missing x-user-id' });
-  }
   if (role !== 'vendor') {
     return res.status(403).json({ error: 'Vendor account required' });
   }
@@ -230,6 +298,7 @@ const requireVendorOwnership = async (req, res, next) => {
 // vendor needs to see (and re-enable) items the public /menu endpoint hides.
 app.get(
   ['/vendor/menu', '/api/food/vendor/menu', '/api/v1/food/vendor/menu'],
+  verifyJWT,
   requireVendorOwnership,
   async (req, res) => {
     try {
@@ -245,6 +314,7 @@ app.get(
 // CREATE a menu item
 app.post(
   ['/vendor/menu', '/api/food/vendor/menu', '/api/v1/food/vendor/menu'],
+  verifyJWT,
   requireVendorOwnership,
   async (req, res) => {
     const { name, category, priceCents } = req.body;
@@ -278,6 +348,7 @@ app.post(
 // UPDATE a menu item (name/category/price and/or availability toggle)
 app.patch(
   ['/vendor/menu/:itemId', '/api/food/vendor/menu/:itemId', '/api/v1/food/vendor/menu/:itemId'],
+  verifyJWT,
   requireVendorOwnership,
   async (req, res) => {
     const { name, category, priceCents, isAvailable } = req.body;
@@ -312,6 +383,7 @@ app.patch(
 // DELETE a menu item
 app.delete(
   ['/vendor/menu/:itemId', '/api/food/vendor/menu/:itemId', '/api/v1/food/vendor/menu/:itemId'],
+  verifyJWT,
   requireVendorOwnership,
   async (req, res) => {
     try {
@@ -332,11 +404,11 @@ app.delete(
 );
 
 // 3. Initiate Food Order & Stripe PaymentIntent
-app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], async (req, res) => {
+app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], verifyJWT, async (req, res) => {
   const { seatNumber, items, vendorId } = req.body;
-  const userId = req.headers['x-user-id'] || 'anonymous';
+  const userId = req.user.userId;
 
-  if (!seatNumber || !items || items.length === 0) {
+  if (!seatNumber || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'seatNumber and items are required' });
   }
 
@@ -348,19 +420,87 @@ app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], async (req, res
   }
 
   try {
-    const totalAmountCents = items.reduce((acc, item) => acc + (item.priceCents * item.quantity), 0);
+    // The client may only tell us WHICH menu items and HOW MANY.
+    // Prices and names are always taken from MongoDB.
+    const menuItemIds = items.map(item => item.menuItemId);
+
+    if (
+      menuItemIds.some(
+        id => typeof id !== 'string' || !mongoose.Types.ObjectId.isValid(id)
+      )
+    ) {
+      return res.status(400).json({ error: 'Invalid menu item ID' });
+    }
+
+    const menuItems = await MenuItem.find({
+      _id: { $in: menuItemIds },
+      isAvailable: true
+    });
+
+    if (menuItems.length !== items.length) {
+      return res.status(400).json({
+        error: 'One or more menu items are unavailable or do not exist'
+      });
+    }
+
+    const menuById = new Map(
+      menuItems.map(item => [item._id.toString(), item])
+    );
+
+    const trustedItems = [];
+
+    for (const requestedItem of items) {
+      if (!Number.isInteger(requestedItem.quantity) || requestedItem.quantity <= 0) {
+        return res.status(400).json({
+          error: 'Each item quantity must be a positive integer'
+        });
+      }
+
+      const menuItem = menuById.get(requestedItem.menuItemId);
+
+      if (!menuItem) {
+        return res.status(400).json({
+          error: 'One or more menu items are unavailable or do not exist'
+        });
+      }
+
+      if (vendorId && String(menuItem.vendorId) !== String(vendorId)) {
+        return res.status(400).json({
+          error: 'Menu item does not belong to the selected vendor'
+        });
+      }
+
+      trustedItems.push({
+        menuItemId: menuItem._id,
+        name: menuItem.name,
+        quantity: requestedItem.quantity,
+        priceCents: menuItem.priceCents
+      });
+    }
+
+    // Calculate the amount exclusively from server-side menu prices.
+    const totalAmountCents = trustedItems.reduce(
+      (acc, item) => acc + (item.priceCents * item.quantity),
+      0
+    );
+
+    if (!Number.isSafeInteger(totalAmountCents) || totalAmountCents <= 0) {
+      return res.status(400).json({
+        error: 'Invalid order total'
+      });
+    }
 
     // Create pending order record in MongoDB
     const order = await Order.create({
       userId,
       vendorId: vendorId || null,
       seatNumber: seatNumber.toUpperCase().trim(),
-      items,
+      items: trustedItems,
       totalAmountCents,
       paymentStatus: 'PENDING'
     });
 
-    // Create Stripe PaymentIntent using active key instance
+    // Create Stripe PaymentIntent using server-calculated amount
     const activeStripe = new Stripe(activeKey);
     const paymentIntent = await activeStripe.paymentIntents.create({
       amount: totalAmountCents,
@@ -374,7 +514,9 @@ app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], async (req, res
     order.paymentIntentId = paymentIntent.id;
     await order.save();
 
-    console.log(`✅ PaymentIntent Created: ${paymentIntent.id} ($${(totalAmountCents / 100).toFixed(2)}) for Seat ${order.seatNumber}`);
+    console.log(
+      `✅ PaymentIntent Created: ${paymentIntent.id} ($${(totalAmountCents / 100).toFixed(2)}) for Seat ${order.seatNumber}`
+    );
 
     return res.status(201).json({
       orderId: order._id,
@@ -384,12 +526,14 @@ app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], async (req, res
     });
   } catch (err) {
     console.error('❌ Order Checkout Error:', err.message || err);
-    return res.status(500).json({ error: err.message || 'Failed to initiate food order payment' });
+    return res.status(500).json({
+      error: err.message || 'Failed to initiate food order payment'
+    });
   }
 });
 
 // 4. Local Dev Confirmation Endpoint (Instant Local Payment Approval)
-app.post(['/confirm-dev', '/api/food/confirm-dev', '/api/v1/food/confirm-dev'], async (req, res) => {
+app.post(['/confirm-dev', '/api/food/confirm-dev', '/api/v1/food/confirm-dev'], verifyJWT, async (req, res) => {
   const { orderId } = req.body;
 
   if (!orderId) {
@@ -402,12 +546,16 @@ app.post(['/confirm-dev', '/api/food/confirm-dev', '/api/v1/food/confirm-dev'], 
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    if (order.userId !== req.user.userId) {
+      return res.status(403).json({ error: 'You do not own this order' });
+    }
+
     order.paymentStatus = 'COMPLETED';
     await order.save();
 
-    // Broadcast live order to customer seat & kitchen dashboard
+    // Broadcast live order to the owning customer and vendor dashboard
     // e.g. inside /confirm-dev, the webhook handler, and the status PATCH:
-    io.to(`seat:${order.seatNumber}`).emit('orderUpdated', order);
+    io.to(`user:${order.userId}`).emit('orderUpdated', order);
     if (order.vendorId) {
       io.to(`vendor:${order.vendorId}`).emit(order.isNew ? 'newOrder' : 'orderUpdated', order);
     }
@@ -444,7 +592,7 @@ app.post('/api/v1/food/webhook', async (req, res) => {
         order.paymentStatus = 'COMPLETED';
         await order.save();
 
-        io.to(`seat:${order.seatNumber}`).emit('orderUpdated', order);
+        io.to(`user:${order.userId}`).emit('orderUpdated', order);
         io.to('kitchen').emit('newOrder', order);
         console.log(`✅ [STRIPE WEBHOOK] Food Order ${order._id} paid & sent to kitchen`);
       }
@@ -457,9 +605,9 @@ app.post('/api/v1/food/webhook', async (req, res) => {
 });
 
 // 6. Vendor/Runner Order Status Update — now ownership-checked
-app.patch(['/orders/:orderId/status', '/api/food/orders/:orderId/status', '/api/v1/food/orders/:orderId/status'], async (req, res) => {
+app.patch(['/orders/:orderId/status', '/api/food/orders/:orderId/status', '/api/v1/food/orders/:orderId/status'], verifyJWT, requireRole('vendor'), async (req, res) => {
   const { status } = req.body;
-  const requestingUserId = req.headers['x-user-id'];
+  const requestingUserId = req.user.userId;
   const valid = ['RECEIVED', 'PREPARING', 'OUT_FOR_DELIVERY', 'DELIVERED'];
 
   if (!valid.includes(status)) {
@@ -479,7 +627,7 @@ app.patch(['/orders/:orderId/status', '/api/food/orders/:orderId/status', '/api/
     order.status = status;
     await order.save();
 
-    io.to(`seat:${order.seatNumber}`).emit('orderUpdated', order);
+    io.to(`user:${order.userId}`).emit('orderUpdated', order);
     io.to(`vendor:${order.vendorId}`).emit('orderUpdated', order);
 
     return res.json(order);
