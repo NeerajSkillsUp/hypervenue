@@ -546,7 +546,7 @@ app.post(['/confirm-dev', '/api/food/confirm-dev', '/api/v1/food/confirm-dev'], 
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    if (order.userId !== req.user.userId) {
+    if (String(order.userId) !== String(req.user.userId)) {
       return res.status(403).json({ error: 'You do not own this order' });
     }
 
@@ -620,7 +620,7 @@ app.patch(['/orders/:orderId/status', '/api/food/orders/:orderId/status', '/api/
 
     // Ownership guard: the authenticated user must own the vendor this order belongs to
     const vendor = await Vendor.findById(order.vendorId);
-    if (!vendor || vendor.ownerUserId !== requestingUserId) {
+    if (!vendor || String(vendor.ownerUserId) !== String(requestingUserId)) {
       return res.status(403).json({ error: 'You do not own this order' });
     }
 
