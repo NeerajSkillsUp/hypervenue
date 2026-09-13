@@ -93,6 +93,7 @@ const MenuItem = mongoose.model('MenuItem', menuItemSchema);
 
 const orderSchema = new mongoose.Schema({
   userId: { type: String, required: true },
+  idempotencyKey: { type: String, required: true },
   vendorId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vendor' },
   seatNumber: { type: String, required: true, uppercase: true, trim: true },
   items: [{ menuItemId: mongoose.Schema.Types.ObjectId, name: String, quantity: Number, priceCents: Number }],
@@ -111,6 +112,17 @@ const orderSchema = new mongoose.Schema({
   runnerId: { type: String, default: null },
   createdAt: { type: Date, default: Date.now }
 });
+
+orderSchema.index(
+  { idempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      idempotencyKey: { $type: 'string' }
+    }
+  }
+);
+
 const Order = mongoose.model('Order', orderSchema);
 
 // Shared vendor lookup/self-heal helper. Used by the vendor-orders route and
@@ -405,11 +417,21 @@ app.delete(
 
 // 3. Initiate Food Order & Stripe PaymentIntent
 app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], verifyJWT, async (req, res) => {
-  const { seatNumber, items, vendorId } = req.body;
+  const { seatNumber, items, vendorId, idempotencyKey } = req.body;
   const userId = req.user.userId;
 
   if (!seatNumber || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'seatNumber and items are required' });
+  }
+
+  if (
+    typeof idempotencyKey !== 'string' ||
+    idempotencyKey.length < 1 ||
+    idempotencyKey.length > 255
+  ) {
+    return res.status(400).json({
+      error: 'idempotencyKey must be a string between 1 and 255 characters'
+    });
   }
 
   // Validate Stripe Key environment variable
@@ -499,26 +521,154 @@ app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], verifyJWT, asyn
       });
     }
 
+    const normalizedSeat = seatNumber.toUpperCase().trim();
+
+    const existingOrder = await Order.findOne({ idempotencyKey });
+
+    if (existingOrder) {
+      if (String(existingOrder.userId) !== String(userId)) {
+        return res.status(409).json({
+          error: 'Idempotency key belongs to another user'
+        });
+      }
+
+      const existingItems = existingOrder.items.map(item => ({
+        menuItemId: String(item.menuItemId),
+        quantity: item.quantity
+      }));
+
+      const requestedItems = trustedItems.map(item => ({
+        menuItemId: String(item.menuItemId),
+        quantity: item.quantity
+      }));
+
+      const sameItems =
+        existingItems.length === requestedItems.length &&
+        existingItems.every(
+          (item, index) =>
+            item.menuItemId === requestedItems[index].menuItemId &&
+            item.quantity === requestedItems[index].quantity
+        );
+
+      if (
+        existingOrder.seatNumber !== normalizedSeat ||
+        !sameItems ||
+        existingOrder.totalAmountCents !== totalAmountCents
+      ) {
+        return res.status(409).json({
+          error: 'Idempotency key cannot be reused for a different order'
+        });
+      }
+
+      const activeStripe = new Stripe(activeKey);
+
+      let paymentIntent;
+
+      if (existingOrder.paymentIntentId) {
+        paymentIntent = await activeStripe.paymentIntents.retrieve(
+          existingOrder.paymentIntentId
+        );
+      } else {
+        paymentIntent = await activeStripe.paymentIntents.create(
+          {
+            amount: existingOrder.totalAmountCents,
+            currency: 'usd',
+            metadata: {
+              orderId: existingOrder._id.toString(),
+              seatNumber: existingOrder.seatNumber
+            }
+          },
+          {
+            idempotencyKey
+          }
+        );
+
+        existingOrder.paymentIntentId = paymentIntent.id;
+        await existingOrder.save();
+      }
+
+      return res.status(200).json({
+        orderId: existingOrder._id,
+        clientSecret: paymentIntent.client_secret,
+        totalAmountCents: existingOrder.totalAmountCents,
+        order: existingOrder
+      });
+    }
+
     // Create pending order record in MongoDB
-    const order = await Order.create({
-      userId,
-      vendorId: orderVendorId,
-      seatNumber: seatNumber.toUpperCase().trim(),
-      items: trustedItems,
-      totalAmountCents,
-      paymentStatus: 'PENDING'
-    });
+    let order;
+
+    try {
+      order = await Order.create({
+        userId,
+        idempotencyKey,
+        vendorId: orderVendorId,
+        seatNumber: normalizedSeat,
+        items: trustedItems,
+        totalAmountCents,
+        paymentStatus: 'PENDING'
+      });
+    } catch (err) {
+      if (err?.code !== 11000) {
+        throw err;
+      }
+
+      order = await Order.findOne({ idempotencyKey });
+
+      if (!order) {
+        throw err;
+      }
+
+      if (String(order.userId) !== String(userId)) {
+        return res.status(409).json({
+          error: 'Idempotency key belongs to another user'
+        });
+      }
+
+      const existingItems = order.items.map(item => ({
+        menuItemId: String(item.menuItemId),
+        quantity: item.quantity
+      }));
+
+      const requestedItems = trustedItems.map(item => ({
+        menuItemId: String(item.menuItemId),
+        quantity: item.quantity
+      }));
+
+      const sameItems =
+        existingItems.length === requestedItems.length &&
+        existingItems.every(
+          (item, index) =>
+            item.menuItemId === requestedItems[index].menuItemId &&
+            item.quantity === requestedItems[index].quantity
+        );
+
+      if (
+        order.seatNumber !== normalizedSeat ||
+        !sameItems ||
+        order.totalAmountCents !== totalAmountCents
+      ) {
+        return res.status(409).json({
+          error: 'Idempotency key cannot be reused for a different order'
+        });
+      }
+    }
 
     // Create Stripe PaymentIntent using server-calculated amount
     const activeStripe = new Stripe(activeKey);
-    const paymentIntent = await activeStripe.paymentIntents.create({
-      amount: totalAmountCents,
-      currency: 'usd',
-      metadata: {
-        orderId: order._id.toString(),
-        seatNumber: order.seatNumber
+    const paymentIntent = await activeStripe.paymentIntents.create(
+      {
+        amount: totalAmountCents,
+        currency: 'usd',
+        metadata: {
+          orderId: order._id.toString(),
+          seatNumber: order.seatNumber
+        }
+      },
+      {
+        idempotencyKey
       }
-    });
+    );
 
     order.paymentIntentId = paymentIntent.id;
     await order.save();
