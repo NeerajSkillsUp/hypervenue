@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import api from '../api';
 
@@ -99,6 +99,7 @@ export default function FoodOrdering({ token, seatNumber = 'A1' }) {
   const [isInitiating, setIsInitiating] = useState(false);
   const [clientSecret, setClientSecret] = useState('');
   const [pendingOrderId, setPendingOrderId] = useState(null);
+  const foodCheckoutIdempotencyKey = useRef(null);
 
   useEffect(() => {
     // 1. Fetch Food Menu
@@ -171,6 +172,11 @@ export default function FoodOrdering({ token, seatNumber = 'A1' }) {
   // Open modal and fetch PaymentIntent clientSecret from backend
   const handleOpenCheckoutModal = async () => {
     if (cart.length === 0) return;
+
+    if (!foodCheckoutIdempotencyKey.current) {
+      foodCheckoutIdempotencyKey.current = crypto.randomUUID();
+    }
+
     setShowPaymentModal(true);
     setIsInitiating(true);
     setClientSecret('');
@@ -179,6 +185,7 @@ export default function FoodOrdering({ token, seatNumber = 'A1' }) {
       const checkoutRes = await api.post('/api/food/orders', {
         seatNumber: normalizedSeat,
         items: cart,
+        idempotencyKey: foodCheckoutIdempotencyKey.current,
       });
 
       setClientSecret(checkoutRes.data.clientSecret);
@@ -187,6 +194,9 @@ export default function FoodOrdering({ token, seatNumber = 'A1' }) {
       console.error('Failed to initiate Stripe checkout:', err);
       alert('Failed to initialize payment gateway.');
       setShowPaymentModal(false);
+      setClientSecret('');
+      setPendingOrderId(null);
+      foodCheckoutIdempotencyKey.current = null;
     } finally {
       setIsInitiating(false);
     }
@@ -196,6 +206,7 @@ export default function FoodOrdering({ token, seatNumber = 'A1' }) {
     setCart([]);
     setShowPaymentModal(false);
     setClientSecret('');
+    foodCheckoutIdempotencyKey.current = null;
   };
 
   const totalCents = cart.reduce((acc, item) => acc + (item.priceCents * item.quantity), 0);
@@ -456,7 +467,12 @@ export default function FoodOrdering({ token, seatNumber = 'A1' }) {
                   orderId={pendingOrderId}
                   totalCents={totalCents}
                   onPaymentSuccess={handlePaymentSuccess}
-                  onCancel={() => setShowPaymentModal(false)}
+                  onCancel={() => {
+                    setShowPaymentModal(false);
+                    setClientSecret('');
+                    setPendingOrderId(null);
+                    foodCheckoutIdempotencyKey.current = null;
+                  }}
                 />
               </Elements>
             ) : (
