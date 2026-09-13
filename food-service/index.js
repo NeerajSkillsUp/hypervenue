@@ -693,6 +693,10 @@ app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], verifyJWT, asyn
 
 // 4. Local Dev Confirmation Endpoint (Instant Local Payment Approval)
 app.post(['/confirm-dev', '/api/food/confirm-dev', '/api/v1/food/confirm-dev'], verifyJWT, async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
   const { orderId } = req.body;
 
   if (!orderId) {
