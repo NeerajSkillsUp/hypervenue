@@ -201,12 +201,26 @@ app.post(['/checkin', '/api/booking/checkin', '/api/v1/booking/checkin'],verifyJ
       });
     }
 
-    await pool.query(
-      'UPDATE bookings SET checked_in = TRUE, checked_in_at = NOW() WHERE id = $1',
+    const updateResult = await pool.query(
+      `UPDATE bookings
+      SET checked_in = TRUE, checked_in_at = NOW()
+      WHERE id = $1
+        AND payment_status = 'COMPLETED'
+        AND checked_in = FALSE
+      RETURNING seat_id, checked_in_at`,
       [bookingId]
     );
 
-    return res.json({ message: 'Entry granted', seatId: booking.seat_id });
+    if (updateResult.rowCount === 0) {
+      return res.status(409).json({
+        error: 'Ticket already checked in or is not eligible for check-in'
+      });
+    }
+
+    return res.json({
+      message: 'Entry granted',
+      seatId: updateResult.rows[0].seat_id
+    });
   } catch (err) {
     console.error('Checkin error:', err);
     return res.status(500).json({ error: 'Check-in failed' });
