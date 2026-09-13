@@ -33,13 +33,31 @@ function FoodCheckoutForm({ orderId, totalCents, onPaymentSuccess, onCancel }) {
       setErrorMessage(error.message || 'Payment failed');
       setIsProcessing(false);
     } else if (paymentIntent && paymentIntent.status === 'succeeded') {
-      // Notify backend to trigger live socket update for kitchen & seat
       try {
-        await api.post('/api/food/confirm-dev', { orderId });
+        // Tell our backend which Stripe PaymentIntent actually succeeded.
+        // The backend will retrieve the PaymentIntent directly from Stripe
+        // and verify that it belongs to this order.
+        await api.post('/api/food/confirm-payment', {
+          orderId,
+          paymentIntentId: paymentIntent.id,
+        });
+
+        // Only clear the cart / close checkout after the backend
+        // successfully confirms the order.
+        onPaymentSuccess();
       } catch (err) {
-        console.warn('Backend confirmation error:', err);
+        console.error('Payment confirmation error:', err);
+
+        setErrorMessage(
+          err.response?.data?.error ||
+          'Payment succeeded, but the order could not be confirmed yet. Please retry.'
+        );
+
+        // IMPORTANT:
+        // Do NOT call onPaymentSuccess() here.
+        // Otherwise the cart disappears while the order remains PENDING.
+        setIsProcessing(false);
       }
-      onPaymentSuccess();
     }
   };
 

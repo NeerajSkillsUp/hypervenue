@@ -731,7 +731,156 @@ app.post(['/confirm-dev', '/api/food/confirm-dev', '/api/v1/food/confirm-dev'], 
   }
 });
 
-// 5. Stripe Webhook Endpoint
+// 5. Production Payment Confirmation Endpoint
+// The frontend calls this after Stripe confirms the payment.
+// The Stripe webhook remains the asynchronous backup.
+app.post(
+  ['/confirm-payment', '/api/food/confirm-payment', '/api/v1/food/confirm-payment'],
+  verifyJWT,
+  async (req, res) => {
+    const { orderId, paymentIntentId } = req.body;
+
+    if (!orderId || !paymentIntentId) {
+      return res.status(400).json({
+        error: 'orderId and paymentIntentId are required'
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(orderId)) {
+      return res.status(400).json({
+        error: 'Invalid orderId'
+      });
+    }
+
+    try {
+      // 1. Find the order
+      const order = await Order.findById(orderId);
+
+      if (!order) {
+        return res.status(404).json({
+          error: 'Order not found'
+        });
+      }
+
+      // 2. Make sure this user owns the order
+      if (String(order.userId) !== String(req.user.userId)) {
+        return res.status(403).json({
+          error: 'You do not own this order'
+        });
+      }
+
+      // 3. Make sure the PaymentIntent belongs to this order
+      if (order.paymentIntentId !== paymentIntentId) {
+        return res.status(400).json({
+          error: 'PaymentIntent does not belong to this order'
+        });
+      }
+
+      // 4. Make sure the server has a real Stripe test secret
+      const activeKey = process.env.STRIPE_SECRET_KEY;
+
+      if (!activeKey || !activeKey.startsWith('sk_test_')) {
+        console.error('Stripe secret key is missing or invalid');
+        return res.status(500).json({
+          error: 'Stripe payment configuration is invalid'
+        });
+      }
+
+      // 5. Ask Stripe directly for the authoritative PaymentIntent
+      const activeStripe = new Stripe(activeKey);
+
+      const paymentIntent =
+        await activeStripe.paymentIntents.retrieve(paymentIntentId);
+
+      // 6. Verify that Stripe's payment matches our order
+      if (
+        paymentIntent.status !== 'succeeded' ||
+        paymentIntent.metadata?.orderId !== order._id.toString() ||
+        paymentIntent.metadata?.seatNumber !== order.seatNumber ||
+        paymentIntent.amount !== order.totalAmountCents ||
+        paymentIntent.currency !== 'usd'
+      ) {
+        return res.status(409).json({
+          error: 'Stripe payment is not valid for this order'
+        });
+      }
+
+      // 7. Already completed = idempotent success
+      if (order.paymentStatus === 'COMPLETED') {
+        return res.json(order);
+      }
+
+      // 8. Only PENDING orders may become COMPLETED
+      if (order.paymentStatus !== 'PENDING') {
+        return res.status(409).json({
+          error: 'Invalid payment state'
+        });
+      }
+
+      // 9. Atomically change PENDING -> COMPLETED
+      const updatedOrder = await Order.findOneAndUpdate(
+        {
+          _id: order._id,
+          userId: req.user.userId,
+          paymentIntentId,
+          paymentStatus: 'PENDING'
+        },
+        {
+          $set: {
+            paymentStatus: 'COMPLETED'
+          }
+        },
+        {
+          new: true
+        }
+      );
+
+      // 10. Webhook or another request may have completed it first
+      if (!updatedOrder) {
+        const currentOrder = await Order.findById(order._id);
+
+        if (currentOrder?.paymentStatus === 'COMPLETED') {
+          return res.json(currentOrder);
+        }
+
+        return res.status(409).json({
+          error: 'Payment state changed'
+        });
+      }
+
+      // 11. Notify customer
+      io.to(`user:${updatedOrder.userId}`).emit(
+        'orderUpdated',
+        updatedOrder
+      );
+
+      // 12. Notify vendor dashboard
+      if (updatedOrder.vendorId) {
+        io.to(`vendor:${updatedOrder.vendorId}`).emit(
+          'newOrder',
+          updatedOrder
+        );
+      }
+
+      console.log(
+        `✅ [PAYMENT CONFIRM] Food Order ${updatedOrder._id} completed for Seat ${updatedOrder.seatNumber}`
+      );
+
+      return res.json(updatedOrder);
+    } catch (err) {
+      console.error(
+        'Payment confirmation error:',
+        err.message || err
+      );
+
+      return res.status(500).json({
+        error: 'Failed to confirm food payment'
+      });
+    }
+  }
+);
+
+// 6. Stripe Webhook Endpoint
 app.post('/api/v1/food/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret =
@@ -836,7 +985,7 @@ app.post('/api/v1/food/webhook', async (req, res) => {
   return res.json({ received: true });
 });
 
-// 6. Vendor/Runner Order Status Update — now ownership-checked
+// 7. Vendor/Runner Order Status Update — now ownership-checked
 app.patch(['/orders/:orderId/status', '/api/food/orders/:orderId/status', '/api/v1/food/orders/:orderId/status'], verifyJWT, requireRole('vendor'), async (req, res) => {
   const { status } = req.body;
   const requestingUserId = req.user.userId;
