@@ -448,6 +448,7 @@ app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], verifyJWT, asyn
     );
 
     const trustedItems = [];
+    let orderVendorId = null;
 
     for (const requestedItem of items) {
       if (!Number.isInteger(requestedItem.quantity) || requestedItem.quantity <= 0) {
@@ -461,6 +462,14 @@ app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], verifyJWT, asyn
       if (!menuItem) {
         return res.status(400).json({
           error: 'One or more menu items are unavailable or do not exist'
+        });
+      }
+
+      if (orderVendorId === null) {
+        orderVendorId = menuItem.vendorId;
+      } else if (String(orderVendorId) !== String(menuItem.vendorId)) {
+        return res.status(400).json({
+          error: 'All menu items must belong to the same vendor'
         });
       }
 
@@ -493,7 +502,7 @@ app.post(['/orders', '/api/food/orders', '/api/v1/food/orders'], verifyJWT, asyn
     // Create pending order record in MongoDB
     const order = await Order.create({
       userId,
-      vendorId: vendorId || null,
+      vendorId: orderVendorId,
       seatNumber: seatNumber.toUpperCase().trim(),
       items: trustedItems,
       totalAmountCents,
@@ -686,6 +695,12 @@ app.patch(['/orders/:orderId/status', '/api/food/orders/:orderId/status', '/api/
   try {
     const order = await Order.findById(req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    if (order.paymentStatus !== 'COMPLETED') {
+      return res.status(409).json({
+        error: 'Order must be paid before fulfillment status can be updated'
+      });
+    }
 
     // Ownership guard: the authenticated user must own the vendor this order belongs to
     const vendor = await Vendor.findById(order.vendorId);
