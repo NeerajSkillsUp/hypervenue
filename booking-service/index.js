@@ -279,8 +279,14 @@ app.post(['/checkout', '/api/booking/checkout', '/api/v1/booking/checkout'],veri
     return res.status(400).json({ error: 'A valid Seat UUID is required' });
   }
 
-  if (!idempotencyKey) {
-    return res.status(400).json({ error: 'idempotencyKey is required' });
+  if (
+    typeof idempotencyKey !== 'string' ||
+    idempotencyKey.length < 1 ||
+    idempotencyKey.length > 255
+  ) {
+    return res.status(400).json({
+      error: 'idempotencyKey must be a string between 1 and 255 characters'
+    });
   }
 
   try {
