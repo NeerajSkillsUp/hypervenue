@@ -656,7 +656,10 @@ app.post('/api/v1/food/webhook', async (req, res) => {
       }
 
       io.to(`user:${updatedOrder.userId}`).emit('orderUpdated', updatedOrder);
-      io.to('kitchen').emit('newOrder', updatedOrder);
+
+      if (updatedOrder.vendorId) {
+        io.to(`vendor:${updatedOrder.vendorId}`).emit('newOrder', updatedOrder);
+      }
 
       console.log(
         `Food Order ${updatedOrder._id} paid & sent to kitchen`
