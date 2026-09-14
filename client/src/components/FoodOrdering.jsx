@@ -135,6 +135,7 @@ export default function FoodOrdering({ token, seatNumber = 'A1' }) {
 
     socket.on('connect', () => {
       socket.emit('joinSeatRoom', { seatNumber: normalizedSeat });
+      socket.emit('joinMenuRoom');
     });
 
     socket.on('orderUpdated', (updatedOrder) => {
@@ -151,6 +152,15 @@ export default function FoodOrdering({ token, seatNumber = 'A1' }) {
           return [updatedOrder, ...prevOrders];
         }
       });
+    });
+
+    socket.on('menuUpdated', async () => {
+      try {
+        const res = await api.get('/api/food/menu');
+        setMenu(res.data);
+      } catch (err) {
+        console.error('Realtime menu refresh error:', err);
+      }
     });
 
     return () => socket.disconnect();

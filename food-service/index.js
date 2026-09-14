@@ -164,6 +164,12 @@ io.on('connection', (socket) => {
     console.log(`Socket ${socket.id} joined user room ${room}`);
   });
 
+  // NEW: customers join the live menu room
+  socket.on('joinMenuRoom', () => {
+    socket.join('menu');
+    console.log(`Socket ${socket.id} joined menu room`);
+  });
+
   // Renamed from the old generic 'kitchen' room to a room keyed on the
   // vendor account so one vendor's dashboard never sees another vendor's
   // live updates. Matches VendorDashboard.jsx's emit('joinVendorRoom').
@@ -349,6 +355,9 @@ app.post(
         priceCents,
         isAvailable: true
       });
+
+      io.to('menu').emit('menuUpdated');
+
       return res.status(201).json(item);
     } catch (err) {
       console.error('Menu item creation error:', err);
@@ -384,6 +393,9 @@ app.patch(
       if (isAvailable !== undefined) item.isAvailable = !!isAvailable;
 
       await item.save();
+
+      io.to('menu').emit('menuUpdated');
+
       return res.json(item);
     } catch (err) {
       console.error('Menu item update error:', err);
@@ -407,6 +419,9 @@ app.delete(
       }
 
       await item.deleteOne();
+
+      io.to('menu').emit('menuUpdated');
+
       return res.json({ deleted: true, itemId: req.params.itemId });
     } catch (err) {
       console.error('Menu item delete error:', err);
