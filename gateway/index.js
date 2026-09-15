@@ -129,47 +129,78 @@ app.get('/health', (req, res) => {
   res.json({ status: 'API Gateway is healthy' });
 });
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function checkServiceHealth(service, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(`${service.url}/health`);
+
+      if (response.ok) {
+        return {
+          service: service.name,
+          status: response.status,
+          ok: true
+        };
+      }
+
+      // Retry transient 429 responses.
+      if (response.status === 429 && attempt < maxAttempts) {
+        await sleep(attempt * 2000);
+        continue;
+      }
+
+      return {
+        service: service.name,
+        status: response.status,
+        ok: false
+      };
+    } catch (err) {
+      if (attempt < maxAttempts) {
+        await sleep(attempt * 2000);
+        continue;
+      }
+
+      return {
+        service: service.name,
+        status: null,
+        ok: false,
+        error: err.message
+      };
+    }
+  }
+}
+
 app.get('/warmup', async (req, res) => {
   const services = [
     {
       name: 'auth',
-      url: `${process.env.AUTH_SERVICE_URL}/health`
+      url: process.env.AUTH_SERVICE_URL
     },
     {
       name: 'booking',
-      url: `${process.env.BOOKING_SERVICE_URL}/health`
+      url: process.env.BOOKING_SERVICE_URL
     },
     {
       name: 'food',
-      url: `${process.env.FOOD_SERVICE_URL}/health`
+      url: process.env.FOOD_SERVICE_URL
     }
   ];
 
-  const results = await Promise.all(
-    services.map(async (service) => {
-      try {
-        const response = await fetch(service.url);
+  const results = [];
 
-        return {
-          service: service.name,
-          status: response.status,
-          ok: response.ok
-        };
-      } catch (err) {
-        return {
-          service: service.name,
-          status: null,
-          ok: false,
-          error: err.message
-        };
-      }
-    })
-  );
+  // Wake services one at a time.
+  for (const service of services) {
+    const result = await checkServiceHealth(service);
+    results.push(result);
+  }
 
-  const allHealthy = results.every((result) => result.ok);
+  const allHealthy = results.every(result => result.ok);
 
   return res.status(allHealthy ? 200 : 503).json({
-    status: allHealthy ? 'All services are warm' : 'One or more services are unavailable',
+    status: allHealthy
+      ? 'All services are warm'
+      : 'One or more services are unavailable',
     services: results
   });
 });
