@@ -131,44 +131,66 @@ app.get('/health', (req, res) => {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function checkServiceHealth(service, maxAttempts = 3) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const response = await fetch(`${service.url}/health`);
+const WARMUP_TIMEOUT_MS = 90_000;
+const HEALTH_POLL_INTERVAL_MS = 10_000;
+const HEALTH_REQUEST_TIMEOUT_MS = 5_000;
 
-      if (response.ok) {
-        return {
-          service: service.name,
-          status: response.status,
-          ok: true
-        };
-      }
+async function fetchServiceHealth(service) {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    HEALTH_REQUEST_TIMEOUT_MS
+  );
 
-      // Retry transient 429 responses.
-      if (response.status === 429 && attempt < maxAttempts) {
-        await sleep(attempt * 2000);
-        continue;
-      }
+  try {
+    const response = await fetch(`${service.url}/health`, {
+      signal: controller.signal
+    });
 
-      return {
-        service: service.name,
-        status: response.status,
-        ok: false
-      };
-    } catch (err) {
-      if (attempt < maxAttempts) {
-        await sleep(attempt * 2000);
-        continue;
-      }
-
-      return {
-        service: service.name,
-        status: null,
-        ok: false,
-        error: err.message
-      };
-    }
+    return {
+      service: service.name,
+      status: response.status,
+      ok: response.ok
+    };
+  } catch (err) {
+    return {
+      service: service.name,
+      status: null,
+      ok: false,
+      error: err.name === 'AbortError'
+        ? 'Health request timed out'
+        : err.message
+    };
+  } finally {
+    clearTimeout(timeout);
   }
+}
+
+async function waitForServiceHealth(service, deadline) {
+  let lastResult = null;
+
+  while (Date.now() < deadline) {
+    lastResult = await fetchServiceHealth(service);
+
+    if (lastResult.ok) {
+      return lastResult;
+    }
+
+    const remaining = deadline - Date.now();
+
+    if (remaining <= 0) {
+      break;
+    }
+
+    await sleep(Math.min(HEALTH_POLL_INTERVAL_MS, remaining));
+  }
+
+  return lastResult || {
+    service: service.name,
+    status: null,
+    ok: false,
+    error: 'Warmup deadline exceeded'
+  };
 }
 
 app.get('/warmup', async (req, res) => {
@@ -187,13 +209,18 @@ app.get('/warmup', async (req, res) => {
     }
   ];
 
-  const results = [];
+  const deadline = Date.now() + WARMUP_TIMEOUT_MS;
 
-  // Wake services one at a time.
-  for (const service of services) {
-    const result = await checkServiceHealth(service);
-    results.push(result);
-  }
+  // First request each service so Render receives traffic
+  // and can start waking sleeping Free instances.
+  await Promise.all(
+    services.map(service => fetchServiceHealth(service))
+  );
+
+  // Then wait for all services concurrently.
+  const results = await Promise.all(
+    services.map(service => waitForServiceHealth(service, deadline))
+  );
 
   const allHealthy = results.every(result => result.ok);
 
