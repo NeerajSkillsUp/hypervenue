@@ -172,6 +172,10 @@ app.get('/warmup', async (req, res) => {
     {
       name: 'auth',
       url: process.env.AUTH_SERVICE_URL
+    },
+    {
+      name: 'food',
+      url: process.env.FOOD_SERVICE_URL
     }
   ];
 
