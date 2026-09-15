@@ -132,11 +132,12 @@ app.get('/health', (req, res) => {
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const WARMUP_TIMEOUT_MS = 90_000;
-const HEALTH_POLL_INTERVAL_MS = 10_000;
+const HEALTH_POLL_INTERVAL_MS = 5_000;
 const HEALTH_REQUEST_TIMEOUT_MS = 5_000;
 
 async function fetchServiceHealth(service) {
   const controller = new AbortController();
+
   const timeout = setTimeout(
     () => controller.abort(),
     HEALTH_REQUEST_TIMEOUT_MS
@@ -194,41 +195,28 @@ async function waitForServiceHealth(service, deadline) {
 }
 
 app.get('/warmup', async (req, res) => {
-  const services = [
-    {
-      name: 'auth',
-      url: process.env.AUTH_SERVICE_URL
-    },
-    {
-      name: 'booking',
-      url: process.env.BOOKING_SERVICE_URL
-    },
-    {
-      name: 'food',
-      url: process.env.FOOD_SERVICE_URL
-    }
-  ];
+  const bookingService = {
+    name: 'booking',
+    url: process.env.BOOKING_SERVICE_URL
+  };
 
   const deadline = Date.now() + WARMUP_TIMEOUT_MS;
 
-  // First request each service so Render receives traffic
-  // and can start waking sleeping Free instances.
-  await Promise.all(
-    services.map(service => fetchServiceHealth(service))
+  const result = await waitForServiceHealth(
+    bookingService,
+    deadline
   );
 
-  // Then wait for all services concurrently.
-  const results = await Promise.all(
-    services.map(service => waitForServiceHealth(service, deadline))
-  );
+  if (!result.ok) {
+    return res.status(503).json({
+      status: 'Booking service is unavailable',
+      services: [result]
+    });
+  }
 
-  const allHealthy = results.every(result => result.ok);
-
-  return res.status(allHealthy ? 200 : 503).json({
-    status: allHealthy
-      ? 'All services are warm'
-      : 'One or more services are unavailable',
-    services: results
+  return res.status(200).json({
+    status: 'Critical services are warm',
+    services: [result]
   });
 });
 
