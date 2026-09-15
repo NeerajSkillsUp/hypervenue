@@ -164,23 +164,33 @@ async function fetchServiceHealth(service) {
 }
 
 app.get('/warmup', async (req, res) => {
-  const bookingService = {
-    name: 'booking',
-    url: process.env.BOOKING_SERVICE_URL
-  };
+  const criticalServices = [
+    {
+      name: 'booking',
+      url: process.env.BOOKING_SERVICE_URL
+    },
+    {
+      name: 'auth',
+      url: process.env.AUTH_SERVICE_URL
+    }
+  ];
 
-  const result = await fetchServiceHealth(bookingService);
+  const results = await Promise.all(
+    criticalServices.map(fetchServiceHealth)
+  );
 
-  if (!result.ok) {
+  const failedServices = results.filter((service) => !service.ok);
+
+  if (failedServices.length > 0) {
     return res.status(503).json({
-      status: 'Booking service is unavailable',
-      services: [result]
+      status: 'Critical services are unavailable',
+      services: results
     });
   }
 
   return res.status(200).json({
     status: 'Critical services are warm',
-    services: [result]
+    services: results
   });
 });
 
