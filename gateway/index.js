@@ -129,11 +129,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'API Gateway is healthy' });
 });
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-const WARMUP_TIMEOUT_MS = 90_000;
-const HEALTH_POLL_INTERVAL_MS = 5_000;
-const HEALTH_REQUEST_TIMEOUT_MS = 5_000;
+const HEALTH_REQUEST_TIMEOUT_MS = 90_000;
 
 async function fetchServiceHealth(service) {
   const controller = new AbortController();
@@ -167,45 +163,13 @@ async function fetchServiceHealth(service) {
   }
 }
 
-async function waitForServiceHealth(service, deadline) {
-  let lastResult = null;
-
-  while (Date.now() < deadline) {
-    lastResult = await fetchServiceHealth(service);
-
-    if (lastResult.ok) {
-      return lastResult;
-    }
-
-    const remaining = deadline - Date.now();
-
-    if (remaining <= 0) {
-      break;
-    }
-
-    await sleep(Math.min(HEALTH_POLL_INTERVAL_MS, remaining));
-  }
-
-  return lastResult || {
-    service: service.name,
-    status: null,
-    ok: false,
-    error: 'Warmup deadline exceeded'
-  };
-}
-
 app.get('/warmup', async (req, res) => {
   const bookingService = {
     name: 'booking',
     url: process.env.BOOKING_SERVICE_URL
   };
 
-  const deadline = Date.now() + WARMUP_TIMEOUT_MS;
-
-  const result = await waitForServiceHealth(
-    bookingService,
-    deadline
-  );
+  const result = await fetchServiceHealth(bookingService);
 
   if (!result.ok) {
     return res.status(503).json({

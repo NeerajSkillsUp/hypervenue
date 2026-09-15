@@ -72,7 +72,7 @@ export default function App() {
         setWarmupError('');
 
         await api.get('/warmup', {
-          timeout: 100000,
+          timeout: 180000,
         });
 
         if (!cancelled) {
