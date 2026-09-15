@@ -652,5 +652,9 @@ app.post(
   }
 );
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'Booking Service is healthy' });
+});
+
 const PORT = process.env.PORT || 4002;
 app.listen(PORT, () => console.log(`Booking Service running on port ${PORT}`));

@@ -24,6 +24,8 @@ export default function App() {
   const [userEmail, setUserEmail] = useState(localStorage.getItem('userEmail') || '');
   const [userRole, setUserRole] = useState(localStorage.getItem('userRole') || 'customer');
   const [activeTab, setActiveTab] = useState('seats');
+  const [servicesReady, setServicesReady] = useState(false);
+  const [warmupError, setWarmupError] = useState('');
 
   const [selectedSeat, setSelectedSeat] = useState(() => {
     try {
@@ -61,6 +63,37 @@ export default function App() {
       setAuthHeader(token);
     }
   }, [token]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const warmupServices = async () => {
+      try {
+        setWarmupError('');
+
+        await api.get('/warmup', {
+          timeout: 100000,
+        });
+
+        if (!cancelled) {
+          setServicesReady(true);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setWarmupError(
+            err.response?.data?.status ||
+            'Unable to wake HyperVenue services.'
+          );
+        }
+      }
+    };
+
+    warmupServices();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const resetForm = () => {
     setAuthEmail('');
@@ -234,6 +267,31 @@ export default function App() {
   const currentSeatId = selectedSeat?.id || selectedSeat?.seat_id || selectedSeat?._id;
   const currentSeatNumber = selectedSeat?.number || selectedSeat?.seat_number || selectedSeat?.name || 'A1';
   const currentPriceCents = selectedSeat?.price_cents || selectedSeat?.priceCents || selectedSeat?.price || 15000;
+
+  if (!servicesReady) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <h1 className="text-2xl font-bold mb-3">
+            Waking HyperVenue services...
+          </h1>
+
+          <p className="text-gray-600">
+            This may take up to a minute on the first visit.
+          </p>
+
+          {warmupError && (
+            <button
+              onClick={() => window.location.reload()}
+              className="mt-4 px-4 py-2 rounded bg-black text-white"
+            >
+              Retry
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-indigo-500 selection:text-white">

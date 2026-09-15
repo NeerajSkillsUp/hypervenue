@@ -1068,5 +1068,9 @@ app.post('/api/v1/food/internal/vendors', requireInternalSecret, async (req, res
   }
 });
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'Food Service is healthy' });
+});
+
 const PORT = process.env.PORT || 4003;
 server.listen(PORT, () => console.log(`Food Service listening on port ${PORT}`));

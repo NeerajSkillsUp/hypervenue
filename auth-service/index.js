@@ -212,5 +212,9 @@ app.post('/api/v1/auth/login', async (req, res) => {
   }
 });
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'Auth Service is healthy' });
+});
+
 const PORT = process.env.PORT || 4001;
 app.listen(PORT, () => console.log(`Auth Service running on port ${PORT}`));

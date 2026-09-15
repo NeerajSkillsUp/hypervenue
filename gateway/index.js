@@ -129,5 +129,50 @@ app.get('/health', (req, res) => {
   res.json({ status: 'API Gateway is healthy' });
 });
 
+app.get('/warmup', async (req, res) => {
+  const services = [
+    {
+      name: 'auth',
+      url: `${process.env.AUTH_SERVICE_URL}/health`
+    },
+    {
+      name: 'booking',
+      url: `${process.env.BOOKING_SERVICE_URL}/health`
+    },
+    {
+      name: 'food',
+      url: `${process.env.FOOD_SERVICE_URL}/health`
+    }
+  ];
+
+  const results = await Promise.all(
+    services.map(async (service) => {
+      try {
+        const response = await fetch(service.url);
+
+        return {
+          service: service.name,
+          status: response.status,
+          ok: response.ok
+        };
+      } catch (err) {
+        return {
+          service: service.name,
+          status: null,
+          ok: false,
+          error: err.message
+        };
+      }
+    })
+  );
+
+  const allHealthy = results.every((result) => result.ok);
+
+  return res.status(allHealthy ? 200 : 503).json({
+    status: allHealthy ? 'All services are warm' : 'One or more services are unavailable',
+    services: results
+  });
+});
+
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`API Gateway running on port ${PORT}`));
