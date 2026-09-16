@@ -7,6 +7,12 @@ import GateScanner from './components/GateScanner';
 import FoodOrdering from './components/FoodOrdering';
 import VendorDashboard from './components/VendorDashboard';
 
+const AUTH_SERVICE_URL = import.meta.env.VITE_AUTH_SERVICE_URL || 'http://localhost:4001';
+
+const BOOKING_SERVICE_URL = import.meta.env.VITE_BOOKING_SERVICE_URL || 'http://localhost:4002';
+
+const FOOD_SERVICE_URL = import.meta.env.VITE_FOOD_SERVICE_URL || 'http://localhost:4003';
+
 const setAuthHeader = (token) => {
   if (api && api.defaults) {
     if (!api.defaults.headers) api.defaults.headers = {};
@@ -67,13 +73,25 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
 
+    const wakeService = async (name, url) => {
+      const response = await fetch(`${url}/health`);
+
+      if (!response.ok) {
+        throw new Error(`${name} service returned ${response.status}`);
+      }
+
+      return response;
+    };
+
     const warmupServices = async () => {
       try {
         setWarmupError('');
 
-        await api.get('/warmup', {
-          timeout: 180000,
-        });
+        await Promise.all([
+          wakeService('Auth', AUTH_SERVICE_URL),
+          wakeService('Booking', BOOKING_SERVICE_URL),
+          wakeService('Food', FOOD_SERVICE_URL),
+        ]);
 
         if (!cancelled) {
           setServicesReady(true);
@@ -81,8 +99,7 @@ export default function App() {
       } catch (err) {
         if (!cancelled) {
           setWarmupError(
-            err.response?.data?.status ||
-            'Unable to wake HyperVenue services.'
+            err.message || 'Unable to wake HyperVenue services.'
           );
         }
       }
